@@ -1,8 +1,43 @@
+import ..environment as env
 
+class Position:
+    private:
+    mut x: float
+    mut y: float
 
 trait Species:
     public:
     let name: str
+
+    fn get_quantity(let self)->float:
+        return self.quantity
+
+    fn get_pos(let self)->Position:
+        return self.pos
     
     protected:
-    mut 
+    mut quantity: float    
+    mut pos: Position
+
+class Adsorbate(Species):
+    pass
+
+class Solute(Species):
+    public:
+    let is_const: bool
+    pass
+
+class Stoichiometry:
+    public:
+    mut species: Species
+    let ratio: int
+
+class Reaction:
+    public:
+    mut node_A: list[Stoichiometry]
+    mut node_B: list[Stoichiometry]
+
+    let fw_rate_coefficient: function[let Reaction, let env.TimeScale, let env.Potential]->float
+    let bw_rate_coefficient: function[let Reaction, let env.TimeScale, let env.Potential]->float
+
+    let is_reversible: bool

@@ -1,2 +1,37 @@
+import environment as env
+import chemical_graphs as cg
 
+mut vacancy = cg.Adsorbate(
+    name = "vacancy",
+    pos = cg.Position(0.1, 0.1),
+    quantity = 0.0
+)
+
+
+mut H_ads = cg.Adsorbate(
+    name = "vacancy",
+    pos = cg.Position(0.9, 0.9),
+    quantity = 1.0
+)
+
+mut H2_gas = cg.Solute(
+    name = "H2",
+    pos = cg.Position(0.9, 0.9),
+    quantity = 1.0,
+    is_const = True    
+)
+
+mut proton = cg.Solute(
+    name = "H2",
+    pos = cg.Position(0.9, 0.9),
+    quantity = 1.0,
+    is_const = True    
+)
+
+
+mut running = True
+
+while running:
+
+    
 

@@ -1,0 +1,15 @@
+
+
+new_type Potential: float
+
+new_type Time: float
+
+new_type Frequency: float
+
+class TimeScale:
+    private:
+    mut period_length: Time
+
+    mut applied_frequency: Frequency
+
+    
