@@ -1,0 +1,8 @@
+
+
+trait Species:
+    public:
+    let name: str
+    
+    protected:
+    mut 
