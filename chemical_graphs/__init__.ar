@@ -32,12 +32,32 @@ class Stoichiometry:
     mut species: Species
     let ratio: int
 
+new_type Fn_RateCoefficient: function[let Reaction, let env.TimeScale, let env.Potential]->float
+
 class Reaction:
     public:
     mut node_A: list[Stoichiometry]
     mut node_B: list[Stoichiometry]
 
-    let fw_rate_coefficient: function[let Reaction, let env.TimeScale, let env.Potential]->float
-    let bw_rate_coefficient: function[let Reaction, let env.TimeScale, let env.Potential]->float
+    let fw_rate_coefficient: Fn_RateCoefficient
+    let bw_rate_coefficient: Fn_RateCoefficient
 
     let is_reversible: bool
+
+    fn __init__(
+        mut self, 
+        let node_A: list[Stoichiometry], 
+        let node_B: list[Stoichiometry],
+        let fw_rate_coefficient: Fn_RateCoefficient,
+        let bw_rate_coefficient: Fn_RateCoefficient,
+        let is_reversible: bool = True
+        )->Self:
+        
+        self.node_A = node_A
+        self.node_B = node_B
+        
+        self.fw_rate_coefficient = fw_rate_coefficient
+        self.bw_rate_coefficient = bw_rate_coefficient
+
+        self.is_reversible = is_reversible
+        return self

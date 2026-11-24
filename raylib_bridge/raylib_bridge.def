@@ -1,0 +1,35 @@
+; raylib_bridge.def - functions exported by raylib_bridge.dll.
+; Keep this list the same as the declarations in raylib_bridge.h
+; (tests/test_raylib_bridge.ar calls every one of them).
+LIBRARY raylib_bridge
+EXPORTS
+    set_config_flags
+    set_trace_log_level
+    init_window
+    close_window
+    window_should_close
+    is_window_ready
+    set_target_fps
+    get_screen_width
+    get_screen_height
+    get_frame_time
+    get_time
+    get_fps
+    begin_drawing
+    end_drawing
+    clear_background
+    draw_line_ex
+    draw_circle_v
+    draw_circle_lines_v
+    draw_rectangle_v
+    draw_triangle
+    draw_text
+    measure_text
+    draw_fps
+    get_mouse_position
+    is_mouse_button_pressed
+    is_mouse_button_down
+    is_key_pressed
+    draw_filled_circle
+    draw_curved_arrow
+    read_screen_pixel

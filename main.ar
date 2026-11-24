@@ -1,5 +1,7 @@
 import environment as env
 import chemical_graphs as cg
+import[cpp-dll] raylib_bridge.raylib_bridge as rl
+import raylib_bridge.raylib_consts as rlc
 
 mut vacancy = cg.Adsorbate(
     name = "vacancy",
@@ -9,7 +11,7 @@ mut vacancy = cg.Adsorbate(
 
 
 mut H_ads = cg.Adsorbate(
-    name = "vacancy",
+    name = "H_ads",
     pos = cg.Position(0.9, 0.9),
     quantity = 1.0
 )
@@ -22,16 +24,38 @@ mut H2_gas = cg.Solute(
 )
 
 mut proton = cg.Solute(
-    name = "H2",
+    name = "H+",
     pos = cg.Position(0.9, 0.9),
     quantity = 1.0,
-    is_const = True    
+    is_const = True
 )
 
+
+# draw_species_label — 化学種の名前と量を 1 行の文字で描く（begin_drawing と end_drawing の間で呼ぶ）
+#   species: 描く化学種（Adsorbate / Solute）
+#   row:     上から何行目に描くか（0 始まり）
+# 例: draw_species_label(vacancy, 0)
+fn draw_species_label(let species: cg.Species, let row: int) -> None:
+    let label = species.name + ": " + str(species.get_quantity())
+    rl.draw_text(label.encode("utf-8"), 20, 60 + 30 * row, 20, rl.Color(40, 40, 40, 255))
+
+
+rl.set_config_flags(rlc.FLAG_MSAA_4X_HINT)
+rl.init_window(800, 600, "graph_visualizer".encode("utf-8"))
+rl.set_target_fps(60)
 
 mut running = True
 
 while running:
+    rl.begin_drawing()
+    rl.clear_background(rl.Color(245, 245, 245, 255))
+    rl.draw_text("graph_visualizer".encode("utf-8"), 20, 20, 24, rl.Color(40, 40, 40, 255))
+    draw_species_label(vacancy, 0)
+    draw_species_label(H_ads, 1)
+    draw_species_label(H2_gas, 2)
+    draw_species_label(proton, 3)
+    rl.end_drawing()
+    running = not rl.window_should_close()
 
-    
+rl.close_window()
 

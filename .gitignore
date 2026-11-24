@@ -1,0 +1,6 @@
+# raylib 本体（raylib_bridge/install_raylib.ps1 がダウンロードして置く）
+/third_party/raylib/
+
+# raylib_bridge のビルド成果物（raylib_bridge/build.ps1 が作る）
+/raylib_bridge/build/
+/raylib_bridge/raylib_bridge.dll

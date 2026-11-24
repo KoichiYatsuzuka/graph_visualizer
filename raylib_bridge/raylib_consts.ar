@@ -1,0 +1,38 @@
+# raylib_consts.ar — raylib_bridge.h の関数に渡す raylib の定数（raylib 5.5 の raylib.h の enum の値）
+#
+# Arrow はヘッダの enum / #define を読まないので、使う値をここに写す。値は raylib.h と同じ。
+# 足りない値は third_party/raylib/include/raylib.h の enum から足す。
+#
+# 使い方:
+#     import raylib_bridge.raylib_consts as rlc          # main.ar から
+#     import ..raylib_bridge.raylib_consts as rlc        # tests/*.ar から
+#     rl.set_config_flags(rlc.FLAG_MSAA_4X_HINT)
+#     rl.set_trace_log_level(rlc.LOG_WARNING)
+#
+# 色（rl.Color）は定数にできない（const は構文解析の時点で値の定まるものだけ）ので、
+# 必要な所で rl.Color(r, g, b, a) と書く。
+
+# set_config_flags の引数（ConfigFlags）。複数指定するときは | で重ねる。init_window の前に呼ぶ。
+const FLAG_WINDOW_RESIZABLE = 4      # 0x04 ウィンドウの大きさを変えられる
+const FLAG_MSAA_4X_HINT = 32         # 0x20 4x MSAA（円や線の縁を滑らかにする）
+const FLAG_VSYNC_HINT = 64           # 0x40 V-Sync
+const FLAG_WINDOW_HIDDEN = 128       # 0x80 ウィンドウを表示しない（自動テスト用）
+const FLAG_WINDOW_HIGHDPI = 8192     # 0x2000 HighDPI
+
+# set_trace_log_level の引数（TraceLogLevel）。指定した重さ以上のログだけを出す。
+const LOG_ALL = 0
+const LOG_DEBUG = 2
+const LOG_INFO = 3
+const LOG_WARNING = 4
+const LOG_ERROR = 5
+const LOG_NONE = 7
+
+# is_mouse_button_pressed / is_mouse_button_down の引数（MouseButton）
+const MOUSE_BUTTON_LEFT = 0
+const MOUSE_BUTTON_RIGHT = 1
+const MOUSE_BUTTON_MIDDLE = 2
+
+# is_key_pressed の引数（KeyboardKey）。英字キーは大文字の ASCII コード（'A' = 65）。
+const KEY_SPACE = 32
+const KEY_ESCAPE = 256
+const KEY_ENTER = 257
