@@ -54,6 +54,9 @@ while running:
     draw_species_label(H_ads, 1)
     draw_species_label(H2_gas, 2)
     draw_species_label(proton, 3)
+    rl.draw_filled_circle(100.0, 120.0, 30.0, rl.Color(200, 20, 20, 255))
+    rl.draw_filled_circle(300.0, 320.0, 30.0, rl.Color(20, 20, 200, 255))
+    rl.draw_curved_arrow(180.0, 120.0, 380.0, 320.0, 6.0, rl.Color(200, 20, 20, 255), rl.Color(20, 20, 200, 255), 0.005)
     rl.end_drawing()
     running = not rl.window_should_close()
 
