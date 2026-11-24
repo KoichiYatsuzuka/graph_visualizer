@@ -46,6 +46,18 @@ typedef struct { float x, y; } Vector2;
 extern "C" {
 #endif
 
+// Glue classes
+class Position_CPP{
+public:
+    float x;
+    float y;
+
+    Position_CPP(float _x, float _y){
+        x = _x;
+        y = _y;
+    }
+};
+
 // -- window and timing ---------------------------------------------------------
 // Call set_config_flags (optional) -> init_window -> ... -> close_window, in this order.
 // The flag and log-level values are in raylib_bridge/raylib_consts.ar.

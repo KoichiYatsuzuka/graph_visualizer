@@ -1,9 +1,18 @@
 import ..environment as env
+import[cpp-dll] ..raylib_bridge.raylib_bridge as rl
 
 class Position:
     private:
     mut x: float
     mut y: float
+
+    public:
+    # __cast__[rl.Position_CPP] — C++ 側の座標クラス rl.Position_CPP へ変換する（`p => rl.Position_CPP` で呼ぶ）
+    #   戻り値: x, y をそのまま写した rl.Position_CPP（float32 に丸められる。ピクセルへの換算はしない）
+    #   ⚠ let 仮引数への自動キャストは効かない（キャスト先が C++ の型だと静的エラー・2026-11-24 実測）。=> を書く。
+    #   例: let position_cpp = vacancy.get_pos() => rl.Position_CPP
+    fn __cast__[rl.Position_CPP](let self) -> rl.Position_CPP:
+        return rl.Position_CPP(self.x, self.y)
 
 trait Species:
     public:
