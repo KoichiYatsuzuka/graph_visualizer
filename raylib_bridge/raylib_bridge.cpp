@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstddef>
 #include <utility>
+#include <vector>
 
 #include "raylib.h"
 #include "rlgl.h"
@@ -109,6 +110,14 @@ constexpr double ARROW_STRAIGHT_SAGITTA_PX = 1.0e-2;
 // Length of one straight piece approximating a curved shaft, and the cap on the number of pieces.
 constexpr float ARROW_ARC_PIECE_LENGTH_PX = 4.0f;
 constexpr int ARROW_ARC_MAX_PIECES = 1024;
+// Where middle_color sits along a still (not flowing) shaft, as a fraction of the shaft length.
+constexpr double ARROW_SHAFT_MIDDLE_FRACTION = 0.5;
+// A flowing shaft shows the loop start -> middle -> end -> start once; each of the three color changes
+// takes this fraction of the shaft.
+constexpr int ARROW_FLOW_COLOR_COUNT = 3;
+constexpr double ARROW_FLOW_STOP_SPACING = 1.0 / ARROW_FLOW_COLOR_COUNT;
+// Joints of a shaft closer than this (fraction of the shaft) are merged.
+constexpr double ARROW_JOINT_MERGE_FRACTION = 1.0e-9;
 constexpr double PI_DOUBLE = 3.14159265358979323846;
 
 // filled_circle_segment_count - number of edge segments so that the edge error is at most
@@ -145,7 +154,8 @@ int filled_circle_segment_count(float radius)
 //   sweep_angle (double)     - signed angle from start to end, radians, |sweep_angle| <= pi (only when is_arc).
 //                              Negative means counter-clockwise on screen, because y grows downward.
 //   length (double)          - length of the centre line in pixels.
-// Functions using it: make_arrow_path, arrow_path_point, arrow_path_normal, draw_curved_arrow.
+// Functions using it: make_arrow_path, arrow_path_point, arrow_path_normal, shaft_piece_count,
+//   shaft_joint_fractions, draw_arrow_shaft, draw_arrow_head, draw_gradient_arrow.
 struct ArrowPath {
     Vector2 start;
     Vector2 end;
@@ -276,6 +286,141 @@ Color lerp_color(Color from_color, Color to_color, float fraction)
     };
 }
 
+// ShaftGradient - colors along a shaft; the color changes linearly between the color stops.
+//
+// Members:
+//   start_color (Color)  - see below.
+//   middle_color (Color) - see below.
+//   end_color (Color)    - see below. The head is always end_color.
+//   is_flowing (bool)    - false (still): start_color at the start point, middle_color at
+//                          ARROW_SHAFT_MIDDLE_FRACTION of the shaft, end_color where the head begins.
+//                          true (flowing): the shaft shows one cycle of the loop start -> middle -> end -> start
+//                          (each change takes ARROW_FLOW_STOP_SPACING of the shaft), shifted toward the head
+//                          by flow_phase.
+//   flow_phase (double)  - shift of the loop in shaft lengths (cycles); only the fractional part matters.
+//                          Used only when is_flowing; must be finite.
+// Functions using it: shaft_gradient_color, shaft_color_stop_fractions, draw_arrow_shaft, draw_gradient_arrow.
+struct ShaftGradient {
+    Color start_color;
+    Color middle_color;
+    Color end_color;
+    bool is_flowing;
+    double flow_phase;
+};
+
+// fractional_part - x - floor(x), in [0, 1) (it can round up to 1 for a tiny negative x).
+//
+// Example:
+//   fractional_part(1.25) == 0.25, fractional_part(-0.75) == 0.25
+double fractional_part(double value) { return value - std::floor(value); }
+
+// shaft_gradient_color - color of the shaft at the given fraction of its length.
+//
+// Arguments:
+//   gradient - colors and mode of the shaft (ShaftGradient).
+//   fraction - 0 (start point) .. 1 (where the head begins).
+// Returns:
+//   still:   start_color -> middle_color up to ARROW_SHAFT_MIDDLE_FRACTION, then middle_color -> end_color.
+//   flowing: the color of the loop at fractional_part(fraction - flow_phase); the loop is continuous, so the
+//            pattern has no seam when it wraps around.
+// Example:
+//   shaft_gradient_color({red, green, blue, false, 0.0}, 0.25)   // == {128, 128, 0, 255} (red and green mixed)
+//   shaft_gradient_color({red, green, blue, true, 0.25}, 0.25)   // == red (the loop start moved to 1/4)
+Color shaft_gradient_color(const ShaftGradient& gradient, double fraction)
+{
+    if (!gradient.is_flowing) {
+        if (fraction <= ARROW_SHAFT_MIDDLE_FRACTION) {
+            return lerp_color(gradient.start_color, gradient.middle_color,
+                              static_cast<float>(fraction / ARROW_SHAFT_MIDDLE_FRACTION));
+        }
+        return lerp_color(gradient.middle_color, gradient.end_color,
+                          static_cast<float>((fraction - ARROW_SHAFT_MIDDLE_FRACTION) / (1.0 - ARROW_SHAFT_MIDDLE_FRACTION)));
+    }
+    // Reduce the phase first, so that a large flow_phase does not eat the precision of fraction.
+    const double loop_position = fractional_part(fraction - fractional_part(gradient.flow_phase));
+    const double stop_position = loop_position / ARROW_FLOW_STOP_SPACING;  // 0 .. ARROW_FLOW_COLOR_COUNT
+    if (stop_position < 1.0) {
+        return lerp_color(gradient.start_color, gradient.middle_color, static_cast<float>(stop_position));
+    }
+    if (stop_position < 2.0) {
+        return lerp_color(gradient.middle_color, gradient.end_color, static_cast<float>(stop_position - 1.0));
+    }
+    return lerp_color(gradient.end_color, gradient.start_color, static_cast<float>(std::min(1.0, stop_position - 2.0)));
+}
+
+// shaft_color_stop_fractions - fractions of the shaft where a color of the gradient is reached exactly.
+//
+// Arguments:
+//   gradient - colors and mode of the shaft (ShaftGradient).
+// Returns:
+//   the fractions in [0, 1), unsorted. draw_arrow_shaft puts a joint at each of them; without a joint the
+//   color would be interpolated across it and never reached.
+// Example:
+//   shaft_color_stop_fractions({red, green, blue, true, 0.25})   // == {0.25, 0.5833..., 0.9166...}
+std::vector<double> shaft_color_stop_fractions(const ShaftGradient& gradient)
+{
+    if (!gradient.is_flowing) {
+        return {ARROW_SHAFT_MIDDLE_FRACTION};
+    }
+    std::vector<double> stop_fractions;
+    const double phase_fraction = fractional_part(gradient.flow_phase);
+    for (int stop_index = 0; stop_index < ARROW_FLOW_COLOR_COUNT; ++stop_index) {
+        stop_fractions.push_back(fractional_part(stop_index * ARROW_FLOW_STOP_SPACING + phase_fraction));
+    }
+    return stop_fractions;
+}
+
+// shaft_piece_count - number of equal straight pieces that approximate the centre line of a shaft.
+//
+// Arguments:
+//   path         - the centre line (make_arrow_path).
+//   shaft_length - length of the shaft along the path in pixels.
+// Returns:
+//   1 for a straight shaft; about one piece per ARROW_ARC_PIECE_LENGTH_PX for an arc, at most
+//   ARROW_ARC_MAX_PIECES. draw_arrow_shaft adds joints at the color stops on top of these.
+// Example:
+//   shaft_piece_count(arc_path, 123.1)   // == 31
+int shaft_piece_count(const ArrowPath& path, double shaft_length)
+{
+    if (!path.is_arc) {
+        return 1;
+    }
+    // Cap in double before converting, so that a huge length cannot overflow int.
+    const double length_based_count =
+        std::min(std::ceil(shaft_length / ARROW_ARC_PIECE_LENGTH_PX), static_cast<double>(ARROW_ARC_MAX_PIECES));
+    return std::max(1, static_cast<int>(length_based_count));
+}
+
+// shaft_joint_fractions - sorted fractions of the shaft (0 .. 1, both included) where pieces join.
+//
+// Arguments:
+//   path, shaft_length - as in shaft_piece_count.
+//   gradient           - colors and mode of the shaft; its color stops become joints.
+// Returns:
+//   the equal division of shaft_piece_count plus the color stops, sorted, without near duplicates.
+// Example:
+//   shaft_joint_fractions(straight_path, 108.0, {red, green, blue, false, 0.0})   // == {0, 0.5, 1}
+std::vector<double> shaft_joint_fractions(const ArrowPath& path, double shaft_length, const ShaftGradient& gradient)
+{
+    const int piece_count = shaft_piece_count(path, shaft_length);
+    std::vector<double> joint_fractions;
+    for (int piece_index = 0; piece_index <= piece_count; ++piece_index) {
+        joint_fractions.push_back(static_cast<double>(piece_index) / piece_count);
+    }
+    for (const double stop_fraction : shaft_color_stop_fractions(gradient)) {
+        if (stop_fraction > 0.0 && stop_fraction < 1.0) {
+            joint_fractions.push_back(stop_fraction);
+        }
+    }
+    std::sort(joint_fractions.begin(), joint_fractions.end());
+    const auto is_near_duplicate = [](double earlier, double later) {
+        return later - earlier < ARROW_JOINT_MERGE_FRACTION;
+    };
+    joint_fractions.erase(std::unique(joint_fractions.begin(), joint_fractions.end(), is_near_duplicate),
+                          joint_fractions.end());
+    return joint_fractions;
+}
+
 // emit_front_facing_triangle - add one triangle with per-vertex colors to raylib's batch.
 //
 // Purpose:
@@ -308,27 +453,24 @@ void emit_front_facing_triangle(Vector2 point_a, Color color_a, Vector2 point_b,
 //   path         - the centre line (make_arrow_path).
 //   shaft_length - where the shaft ends (the head begins), pixels along the path.
 //   thickness    - shaft width in pixels.
-//   start_color  - color at the start point; end_color - color at shaft_length.
+//   gradient     - colors and mode of the shaft (ShaftGradient). Each color stop is a joint between pieces
+//                  (shaft_joint_fractions), so the stop colors are reached exactly.
 // Example:
-//   draw_arrow_shaft(path, path.length - head_length, 8.0f, red, blue);
-void draw_arrow_shaft(const ArrowPath& path, double shaft_length, float thickness, Color start_color,
-                      Color end_color)
+//   draw_arrow_shaft(path, path.length - head_length, 8.0f, ShaftGradient{red, green, blue, false, 0.0});
+void draw_arrow_shaft(const ArrowPath& path, double shaft_length, float thickness, const ShaftGradient& gradient)
 {
-    const int piece_count =
-        path.is_arc ? std::clamp(static_cast<int>(std::ceil(shaft_length / ARROW_ARC_PIECE_LENGTH_PX)), 1,
-                                 ARROW_ARC_MAX_PIECES)
-                    : 1;
+    const std::vector<double> joint_fractions = shaft_joint_fractions(path, shaft_length, gradient);
     const float half_thickness = 0.5f * thickness;
     rlBegin(RL_TRIANGLES);
-    for (int piece_index = 0; piece_index < piece_count; ++piece_index) {
-        const double fraction_from = static_cast<double>(piece_index) / piece_count;
-        const double fraction_to = static_cast<double>(piece_index + 1) / piece_count;
+    for (std::size_t joint_index = 0; joint_index + 1 < joint_fractions.size(); ++joint_index) {
+        const double fraction_from = joint_fractions[joint_index];
+        const double fraction_to = joint_fractions[joint_index + 1];
         const Vector2 center_from = arrow_path_point(path, fraction_from * shaft_length);
         const Vector2 center_to = arrow_path_point(path, fraction_to * shaft_length);
         const Vector2 normal_from = arrow_path_normal(path, fraction_from * shaft_length);
         const Vector2 normal_to = arrow_path_normal(path, fraction_to * shaft_length);
-        const Color color_from = lerp_color(start_color, end_color, static_cast<float>(fraction_from));
-        const Color color_to = lerp_color(start_color, end_color, static_cast<float>(fraction_to));
+        const Color color_from = shaft_gradient_color(gradient, fraction_from);
+        const Color color_to = shaft_gradient_color(gradient, fraction_to);
 
         const Vector2 edge_a_from = {center_from.x + half_thickness * normal_from.x,
                                      center_from.y + half_thickness * normal_from.y};
@@ -372,6 +514,36 @@ void draw_arrow_head(const ArrowPath& path, double head_length, Color head_color
     rlEnd();
 }
 
+// draw_gradient_arrow - common body of draw_curved_arrow_three_colors and draw_curved_arrow_flowing.
+//
+// Arguments:
+//   start_x, start_y, end_x, end_y, thickness, curvature - as in draw_curved_arrow (raylib_bridge.h).
+//   gradient - colors and mode of the shaft (ShaftGradient); the head is gradient.end_color.
+// Purpose:
+//   rejects the inputs that cannot be drawn (non-finite coordinates, thickness <= 0, NaN curvature, the same
+//   two points), then draws the shaft and the head.
+// Example:
+//   draw_gradient_arrow(100.0f, 300.0f, 400.0f, 300.0f, 6.0f, ShaftGradient{red, green, blue, false, 0.0}, 0.005f);
+void draw_gradient_arrow(float start_x, float start_y, float end_x, float end_y, float thickness,
+                         const ShaftGradient& gradient, float curvature)
+{
+    const bool coordinates_finite = std::isfinite(start_x) && std::isfinite(start_y) && std::isfinite(end_x) &&
+                                    std::isfinite(end_y);
+    if (!coordinates_finite || !(thickness > 0.0f) || !std::isfinite(thickness) || std::isnan(curvature)) {
+        return;
+    }
+    const double chord_length = std::hypot(static_cast<double>(end_x) - start_x, static_cast<double>(end_y) - start_y);
+    if (chord_length < ARROW_MIN_CHORD_LENGTH_PX) {
+        return;
+    }
+
+    const ArrowPath path = make_arrow_path(Vector2{start_x, start_y}, Vector2{end_x, end_y}, curvature);
+    const double head_length = std::min(static_cast<double>(ARROW_HEAD_LENGTH_PER_THICKNESS * thickness),
+                                        ARROW_HEAD_MAX_LENGTH_RATIO * path.length);
+    draw_arrow_shaft(path, path.length - head_length, thickness, gradient);
+    draw_arrow_head(path, head_length, gradient.end_color);
+}
+
 } // namespace
 
 // draw_filled_circle - see raylib_bridge.h.
@@ -391,26 +563,47 @@ void draw_filled_circle(float center_x, float center_y, float radius, Color colo
 // Purpose:
 //   draws an edge of the reaction graph: a shaft along a circular arc (or a straight line) with a
 //   start->end color gradient, and a head of end_color whose tip is at the end point.
+//   It is draw_curved_arrow_three_colors with the middle color halfway between start_color and end_color.
 // Example (Arrow):
 //   rl.draw_curved_arrow(100.0, 300.0, 400.0, 300.0, 6.0, rl.Color(230, 41, 55, 255), rl.Color(0, 121, 241, 255), 0.005)
 void draw_curved_arrow(float start_x, float start_y, float end_x, float end_y, float thickness, Color start_color,
                        Color end_color, float curvature)
 {
-    const bool coordinates_finite = std::isfinite(start_x) && std::isfinite(start_y) && std::isfinite(end_x) &&
-                                    std::isfinite(end_y);
-    if (!coordinates_finite || !(thickness > 0.0f) || !std::isfinite(thickness) || std::isnan(curvature)) {
-        return;
-    }
-    const double chord_length = std::hypot(static_cast<double>(end_x) - start_x, static_cast<double>(end_y) - start_y);
-    if (chord_length < ARROW_MIN_CHORD_LENGTH_PX) {
-        return;
-    }
+    const Color middle_color = lerp_color(start_color, end_color, 0.5f);
+    draw_curved_arrow_three_colors(start_x, start_y, end_x, end_y, thickness, start_color, middle_color, end_color,
+                                   curvature);
+}
 
-    const ArrowPath path = make_arrow_path(Vector2{start_x, start_y}, Vector2{end_x, end_y}, curvature);
-    const double head_length = std::min(static_cast<double>(ARROW_HEAD_LENGTH_PER_THICKNESS * thickness),
-                                        ARROW_HEAD_MAX_LENGTH_RATIO * path.length);
-    draw_arrow_shaft(path, path.length - head_length, thickness, start_color, end_color);
-    draw_arrow_head(path, head_length, end_color);
+// draw_curved_arrow_three_colors - see raylib_bridge.h for the meaning of the arguments.
+//
+// Purpose:
+//   draw_curved_arrow with a start -> middle -> end gradient on the shaft, so that the direction of the
+//   edge stands out (e.g. pale -> vivid -> dark). The head is end_color.
+// Example (Arrow):
+//   rl.draw_curved_arrow_three_colors(100.0, 300.0, 400.0, 300.0, 6.0, rl.Color(200, 200, 255, 255), rl.Color(0, 121, 241, 255), rl.Color(0, 30, 90, 255), 0.005)
+void draw_curved_arrow_three_colors(float start_x, float start_y, float end_x, float end_y, float thickness,
+                                    Color start_color, Color middle_color, Color end_color, float curvature)
+{
+    const ShaftGradient still_gradient = {start_color, middle_color, end_color, false, 0.0};
+    draw_gradient_arrow(start_x, start_y, end_x, end_y, thickness, still_gradient, curvature);
+}
+
+// draw_curved_arrow_flowing - see raylib_bridge.h for the meaning of the arguments.
+//
+// Purpose:
+//   draw_curved_arrow_three_colors whose colors flow from the start toward the head when it is called every
+//   frame with a growing flow_phase, so that the direction of the edge is shown by motion.
+// Example (Arrow), one cycle every 2 seconds:
+//   rl.draw_curved_arrow_flowing(100.0, 300.0, 400.0, 300.0, 6.0, rl.Color(200, 20, 20, 255), rl.Color(255, 190, 60, 255), rl.Color(20, 20, 200, 255), 0.005, rl.get_time() / 2.0)
+void draw_curved_arrow_flowing(float start_x, float start_y, float end_x, float end_y, float thickness,
+                               Color start_color, Color middle_color, Color end_color, float curvature,
+                               double flow_phase)
+{
+    if (!std::isfinite(flow_phase)) {
+        return;
+    }
+    const ShaftGradient flowing_gradient = {start_color, middle_color, end_color, true, flow_phase};
+    draw_gradient_arrow(start_x, start_y, end_x, end_y, thickness, flowing_gradient, curvature);
 }
 
 // -- bridge-only helpers ---------------------------------------------------------

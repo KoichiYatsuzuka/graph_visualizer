@@ -7,7 +7,9 @@
 #   1. 非表示のウィンドウを開き、大きさ・状態を取得できる（int / bool の戻り値）
 #   2. 図形と文字を描き、描いた画素を read_screen_pixel で読み戻すと期待どおりの色になる
 #      （Color・Vector2 の値渡し、const char* への bytes、Color の値返し）
-#   3. グラフ描画用の関数（draw_filled_circle・draw_curved_arrow）が、指定どおりの位置・色・曲がる向きで描き、
+#   3. グラフ描画用の関数（draw_filled_circle・draw_curved_arrow・draw_curved_arrow_three_colors・
+#      draw_curved_arrow_flowing）が、指定どおりの位置・色（2 色 / 3 色のグラデーション・流れる向きと量）・
+#      曲がる向きで描き、
 #      範囲外の曲率は半円に切り詰め、描けない入力（同じ 2 点・太さ 0・半径 0）では何も描かない
 #   4. マウス位置（Vector2 の値返し）・時間（float / double）・入力の関数を呼べる
 #   5. ウィンドウを閉じられる
@@ -32,8 +34,13 @@ let OUTLINE_COLOR = rl.Color(40, 40, 40, 255)
 let NODE_COLOR = rl.Color(255, 161, 0, 255)
 let ARROW_START_COLOR = rl.Color(255, 0, 0, 255)
 let ARROW_END_COLOR = rl.Color(0, 0, 255, 255)
-let ARROW_MIDDLE_COLOR = rl.Color(128, 0, 128, 255)    # ARROW_START_COLOR と ARROW_END_COLOR の中間
+let ARROW_START_END_MIXED_COLOR = rl.Color(128, 0, 128, 255)    # ARROW_START_COLOR と ARROW_END_COLOR の中間
+let TRICOLOR_MIDDLE_COLOR = rl.Color(0, 255, 0, 255)            # draw_curved_arrow_three_colors の middle_color
+let TRICOLOR_START_MIDDLE_MIXED_COLOR = rl.Color(128, 128, 0, 255)  # ARROW_START_COLOR と TRICOLOR_MIDDLE_COLOR の中間
+let TRICOLOR_MIDDLE_END_MIXED_COLOR = rl.Color(0, 128, 128, 255)    # TRICOLOR_MIDDLE_COLOR と ARROW_END_COLOR の中間
 const GRADIENT_TOLERANCE = 40                         # グラデーションの画素の色の許容差（各チャンネル）
+const FLOW_PHASE = 0.25                               # draw_curved_arrow_flowing の flow_phase（1/4 周ずれる）
+const LARGE_FLOW_PHASE = 1000.25                      # 小数部が FLOW_PHASE と同じ大きな値（長時間動かした後）
 
 # color_text — 色を "r,g,b,a" の文字列にする（エラーメッセージ用）
 #   color: 文字列にする色
@@ -138,9 +145,10 @@ fn check_test_scene() -> None:
     let outside = rl.read_screen_pixel(-1, 5) mustbe rl.Color
     expect_true(outside.a == 0, "read_screen_pixel returns Color(0, 0, 0, 0) outside the window")
 
-# draw_graph_scene — グラフ描画用の関数（draw_filled_circle・draw_curved_arrow）を 1 フレーム分描く
+# draw_graph_scene — グラフ描画用の関数（draw_filled_circle・draw_curved_arrow・draw_curved_arrow_three_colors・
+#   draw_curved_arrow_flowing）を 1 フレーム分描く
 #   draw_test_scene の後に呼ぶ（背景は draw_test_scene が塗る）。draw_test_scene が使わない右側（x >= 320）と
-#   下側（y >= 240）に置く。各矢印の形は check_graph_scene の説明を見る。
+#   下側（y >= 215）に置く。各矢印の形は check_graph_scene の説明を見る。
 # 例: rl.begin_drawing(); draw_test_scene(); draw_graph_scene(); rl.end_drawing()
 fn draw_graph_scene() -> None:
     rl.draw_filled_circle(400.0, 60.0, 25.0, NODE_COLOR)
@@ -156,9 +164,25 @@ fn draw_graph_scene() -> None:
     rl.draw_curved_arrow(200.0, 300.0, 200.0, 300.0, 8.0, ARROW_START_COLOR, ARROW_END_COLOR, 0.0)
     rl.draw_curved_arrow(150.0, 270.0, 250.0, 270.0, 0.0, ARROW_START_COLOR, ARROW_END_COLOR, 0.0)
     rl.draw_filled_circle(200.0, 330.0, 0.0, NODE_COLOR)
+    # 3 色・直線・右向き（y = 110）: 軸は x = 330〜438、その中央 x = 384 が middle_color
+    rl.draw_curved_arrow_three_colors(330.0, 110.0, 470.0, 110.0, 8.0, ARROW_START_COLOR, TRICOLOR_MIDDLE_COLOR, ARROW_END_COLOR, 0.0)
+    # 3 色・曲率 -0.01（R = 100）・(160, 250) → (300, 250): 弧は上へ 28.6 膨らむ（頂点 (230, 221.4)）。
+    #   弧長 155.1・矢じり 32 → 軸 123.1。軸の中央（始点から弧長 61.5）は (214.1, 222.7) で、弧の中央 (230, 221.4) ではない
+    rl.draw_curved_arrow_three_colors(160.0, 250.0, 300.0, 250.0, 8.0, ARROW_START_COLOR, TRICOLOR_MIDDLE_COLOR, ARROW_END_COLOR, -0.01)
+    # 描けない入力: 太さ 0 → 何も描かない
+    rl.draw_curved_arrow_three_colors(150.0, 285.0, 250.0, 285.0, 0.0, ARROW_START_COLOR, TRICOLOR_MIDDLE_COLOR, ARROW_END_COLOR, 0.0)
+    # 流れる・直線・右向き（y = 185）・flow_phase 0.25: 軸 x = 330〜438 に 赤→緑→青→赤 の 1 周が並び、1/4 周（27 px）
+    #   矢じり側へずれる → 赤は x = 357、緑は x = 393、青は x = 429
+    rl.draw_curved_arrow_flowing(330.0, 185.0, 470.0, 185.0, 8.0, ARROW_START_COLOR, TRICOLOR_MIDDLE_COLOR, ARROW_END_COLOR, 0.0, FLOW_PHASE)
+    # 流れる・直線・右向き（y = 240）・flow_phase 1000.25（小数部 0.25）: 長さ 108 → 矢じり 32・軸 x = 20〜96（76 px）
+    #   → 赤は x = 39、緑は x = 64.3、青は x = 89.7
+    rl.draw_curved_arrow_flowing(20.0, 240.0, 128.0, 240.0, 8.0, ARROW_START_COLOR, TRICOLOR_MIDDLE_COLOR, ARROW_END_COLOR, 0.0, LARGE_FLOW_PHASE)
 
 # check_graph_scene — draw_graph_scene が描いた画素を確かめる（draw_graph_scene の直後、end_drawing の前に呼ぶ）
 #   グラデーション: 直線の矢印の軸は x = 330（始点の色）〜 438（終点の色）で線形に変わり、矢じりは終点の色。
+#     3 色の矢印は軸の中央 x = 384 が middle_color で、その前後でそれぞれ線形に変わる。
+#     流れる矢印は 始点色→中間色→終点色→始点色 の 1 周が軸に並び、flow_phase の小数部だけ矢じり側へずれる
+#     （向きが逆、または flow_phase を無視すると、x = 357 は赤にならない）。
 #   曲がる向き: 曲率 > 0 は進む向きに見て左へ曲がる（弧は右側へ膨らむ）。
 # 例: draw_graph_scene(); check_graph_scene(); rl.end_drawing()
 fn check_graph_scene() -> None:
@@ -166,7 +190,7 @@ fn check_graph_scene() -> None:
     expect_pixel(422, 60, NODE_COLOR, "draw_filled_circle: inside the radius")
     expect_pixel(428, 60, BACKGROUND_COLOR, "draw_filled_circle: outside the radius")
     expect_pixel_near(333, 150, ARROW_START_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow: start color near the start")
-    expect_pixel_near(384, 150, ARROW_MIDDLE_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow: mixed color mid-shaft")
+    expect_pixel_near(384, 150, ARROW_START_END_MIXED_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow: mixed color mid-shaft")
     expect_pixel(460, 150, ARROW_END_COLOR, "draw_curved_arrow: head is the end color")
     expect_pixel(384, 160, BACKGROUND_COLOR, "draw_curved_arrow: shaft is 8 px thick")
     expect_drawn(400, 248, "draw_curved_arrow: curvature > 0 bulges to the right of the direction (down)")
@@ -179,6 +203,20 @@ fn check_graph_scene() -> None:
     expect_pixel(200, 300, BACKGROUND_COLOR, "draw_curved_arrow: nothing for the same two points")
     expect_pixel(200, 270, BACKGROUND_COLOR, "draw_curved_arrow: nothing for thickness 0")
     expect_pixel(200, 330, BACKGROUND_COLOR, "draw_filled_circle: nothing for radius 0")
+    expect_pixel_near(333, 110, ARROW_START_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow_three_colors: start color near the start")
+    expect_pixel_near(357, 110, TRICOLOR_START_MIDDLE_MIXED_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow_three_colors: start and middle mixed at 1/4 of the shaft")
+    expect_pixel_near(384, 110, TRICOLOR_MIDDLE_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow_three_colors: middle color at 1/2 of the shaft")
+    expect_pixel_near(411, 110, TRICOLOR_MIDDLE_END_MIXED_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow_three_colors: middle and end mixed at 3/4 of the shaft")
+    expect_pixel(460, 110, ARROW_END_COLOR, "draw_curved_arrow_three_colors: head is the end color")
+    expect_pixel_near(214, 223, TRICOLOR_MIDDLE_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow_three_colors: middle color at 1/2 of a curved shaft")
+    expect_pixel(200, 285, BACKGROUND_COLOR, "draw_curved_arrow_three_colors: nothing for thickness 0")
+    expect_pixel_near(357, 185, ARROW_START_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow_flowing: start color moved 1/4 toward the head")
+    expect_pixel_near(393, 185, TRICOLOR_MIDDLE_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow_flowing: middle color moved 1/4 toward the head")
+    expect_pixel_near(429, 185, ARROW_END_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow_flowing: end color moved 1/4 toward the head")
+    expect_pixel(460, 185, ARROW_END_COLOR, "draw_curved_arrow_flowing: head stays the end color")
+    expect_pixel_near(39, 240, ARROW_START_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow_flowing: large flow_phase uses its fractional part (start)")
+    expect_pixel_near(64, 240, TRICOLOR_MIDDLE_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow_flowing: large flow_phase uses its fractional part (middle)")
+    expect_pixel_near(89, 240, ARROW_END_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow_flowing: large flow_phase uses its fractional part (end)")
 
 # check_input_and_timing — 入力と時間の関数を呼び、値の範囲を確かめる（init_window の後に呼ぶ）
 # 例: check_input_and_timing()

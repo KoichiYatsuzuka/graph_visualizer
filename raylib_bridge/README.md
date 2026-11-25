@@ -41,11 +41,19 @@ rl.close_window()
 - 文字列（`const char*`）には `str` ではなく `bytes` を渡します（`"text".encode("utf-8")`）。raylib の既定のフォントは ASCII だけです。
 - 色は `rl.Color(r, g, b, a)`、座標は `rl.Vector2(x, y)`（float）。raylib の `RED` などの色の定数はありません。
 - フラグ・ログの重さ・キーなどの数値は [raylib_consts.ar](raylib_consts.ar) にあります。
-- 使える関数の一覧は [raylib_bridge.h](raylib_bridge.h)。次の 3 つは raylib に無い、この DLL だけの関数です。
+- 使える関数の一覧は [raylib_bridge.h](raylib_bridge.h)。次の 5 つは raylib に無い、この DLL だけの関数です。
   - `draw_filled_circle(center_x, center_y, radius, color)` — 円（座標・半径は絶対 pixel。半径が大きくても縁が滑らか）
   - `draw_curved_arrow(start_x, start_y, end_x, end_y, thickness, start_color, end_color, curvature)` — 2 点を結ぶ矢印。
     色は始点→終点のグラデーション（矢じりは終点の色）、`curvature` は 1/R（1/pixel・0 で直線・正なら進む向きに見て左へ曲がる）。
     2 点を通る円弧が無いほど大きい曲率は半円に切り詰める
+  - `draw_curved_arrow_three_colors(start_x, start_y, end_x, end_y, thickness, start_color, middle_color, end_color, curvature)` —
+    3 色のグラデーションの矢印（向きを強調したいとき。例: 淡い色 → 鮮やかな色 → 濃い色）。
+    軸の始点が `start_color`、軸の長さの半分が `middle_color`、矢じりの付け根が `end_color` で、その間は線形に変わる。
+    矢じりは `end_color`。ほかの引数は `draw_curved_arrow` と同じ
+  - `draw_curved_arrow_flowing(start_x, start_y, end_x, end_y, thickness, start_color, middle_color, end_color, curvature, flow_phase)` —
+    色が始点→矢じりへ流れる矢印（毎フレーム呼ぶ）。軸に `start_color → middle_color → end_color → start_color` の
+    1 周分（それぞれ軸の 1/3）が並び、`flow_phase`（単位は周期＝軸 1 本分。小数部だけが効く）だけ矢じり側へずれる。
+    1 周を `cycle_seconds` 秒にするなら `flow_phase = rl.get_time() / cycle_seconds`。矢じりは `end_color` のまま
   - `read_screen_pixel(x, y)` — 描いた画素の色を読む（テスト用）
 
 ## 関数を足すとき

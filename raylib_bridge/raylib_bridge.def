@@ -32,4 +32,6 @@ EXPORTS
     is_key_pressed
     draw_filled_circle
     draw_curved_arrow
+    draw_curved_arrow_three_colors
+    draw_curved_arrow_flowing
     read_screen_pixel

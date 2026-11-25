@@ -118,6 +118,25 @@ void draw_filled_circle(float center_x, float center_y, float radius, Color colo
 //   Nothing is drawn when thickness <= 0, the two points are the same, or an argument is NaN.
 void draw_curved_arrow(float start_x, float start_y, float end_x, float end_y, float thickness, Color start_color, Color end_color, float curvature);
 
+// draw_curved_arrow_three_colors: draw_curved_arrow with a three-color gradient on the shaft, to make the
+//   direction of the arrow stand out (e.g. pale -> vivid -> dark).
+//   start_color at the start point, middle_color halfway along the shaft, end_color where the head begins;
+//   the color changes linearly in between, and the head is end_color.
+//   The other arguments, and the inputs that draw nothing, are the same as draw_curved_arrow.
+//   draw_curved_arrow(..., a, b, ...) draws the same as this function with middle_color halfway between a and b.
+void draw_curved_arrow_three_colors(float start_x, float start_y, float end_x, float end_y, float thickness, Color start_color, Color middle_color, Color end_color, float curvature);
+
+// draw_curved_arrow_flowing: draw_curved_arrow_three_colors whose colors flow from the start toward the head,
+//   to show the direction by motion. Call it every frame with a growing flow_phase.
+//   The shaft shows one cycle of the loop start_color -> middle_color -> end_color -> start_color; each change
+//   takes a third of the shaft, so the pattern stretches with the arrow. The head stays end_color.
+//   flow_phase: how far the loop has moved toward the head, in shaft lengths (cycles). Only the fractional part
+//               matters (0.25, 1.25 and -0.75 draw the same). At 0 the start point is start_color.
+//               For one cycle every cycle_seconds: flow_phase = get_time() / cycle_seconds.
+//   The other arguments, and the inputs that draw nothing, are the same as draw_curved_arrow; nothing is drawn
+//   also when flow_phase is NaN or infinite.
+void draw_curved_arrow_flowing(float start_x, float start_y, float end_x, float end_y, float thickness, Color start_color, Color middle_color, Color end_color, float curvature, double flow_phase);
+
 // -- bridge-only helpers (not in raylib) -----------------------------------------
 // read_screen_pixel: color of the pixel (x, y) drawn so far in the current frame.
 //   Call it between begin_drawing and end_drawing. (0, 0) is the top-left corner; the
