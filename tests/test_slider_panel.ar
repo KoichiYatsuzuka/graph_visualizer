@@ -1,0 +1,159 @@
+# test_slider_panel.ar — slider_panel（C# の WinForms のスライダーの窓）で Arrow の mut 変数を書き換えられることを確かめる自動テスト
+#
+# 実行: arrow tests/test_slider_panel.ar（tests/run_tests.ps1 が tests/test_*.ar をまとめて走らせる）
+# 前提: slider_panel/build.ps1 で SliderPanelBridge.dll と SliderPanelBridge_native.dll を作ってあること。
+#
+# 見ること（窓は表示しない。move_slider は利用者がスライダーを動かしたのと同じ経路: C# の TrackBar → ar_event_fire）:
+#   1. 窓を作ってスライダーを足せる（番号・本数・最初の値は最も近い刻みの値・足しただけでは on_change が呼ばれない）
+#   2. スライダーを動かすと、apply_changes で on_change が呼ばれて mut 変数が書き換わる
+#      - apply_changes を呼ぶまでは書き換わらない
+#      - 値は最も近い刻みの値（double の誤差の無い 0.00212 など）で、get_value と同じ
+#      - 範囲外へ動かすと端の値、同じ位置へ動かしても on_change は呼ばれない
+#      - 2 本のスライダーはそれぞれの変数だけを書き換える（float の変数と int の変数）
+#      - apply_changes の前に何度も動かすと、動いた順にすべて呼ばれ、最後の値が残る
+#   3. おかしな引数は Arrow の例外になる（範囲・刻みの数は ValueError、番号は IndexError）
+#   4. close の後は is_open が False で、add_slider・move_slider は RuntimeError、get_value は閉じたときの値
+# 期待と違えば RuntimeError を raise して非 0 で終わる。
+
+import ..slider_panel as sp
+
+const CURVATURE_MINIMUM = -0.01
+const CURVATURE_MAXIMUM = 0.01           # 既定の刻みの数 1000 で、刻みは 0.00002
+const NODE_COUNT_MINIMUM = 1.0
+const NODE_COUNT_MAXIMUM = 10.0
+const NODE_COUNT_STEP_COUNT = 9          # 1.0, 2.0, …, 10.0 の整数だけ
+
+mut curvature = 0.005
+mut curvature_change_count = 0
+mut node_count = 3
+
+# set_curvature — 曲率のスライダーの on_change（curvature に入れて、呼ばれた回数を数える）
+#   value: スライダーの新しい値
+# 例: set_curvature(0.002)
+fn set_curvature(let value: float) -> None:
+    curvature = value
+    curvature_change_count += 1
+
+# set_node_count — 頂点の数のスライダーの on_change（int の mut 変数へ入れる）
+#   value: スライダーの新しい値（刻みが 1.0 なので整数の値）
+# 例: set_node_count(7.0)
+fn set_node_count(let value: float) -> None:
+    node_count = int(round(value))
+
+# expect_true — 条件が偽なら RuntimeError を投げ、真なら OK を表示する
+#   condition: 確かめる条件
+#   label:     表示とエラーメッセージに出す説明
+# 例: expect_true(controls.is_open(), "is_open after creation")
+fn expect_true(let condition: bool, let label: str) -> None:
+    if not condition:
+        raise RuntimeError("FAILED: " + label)
+    print("OK:", label)
+
+# add_slider_raises_value_error — おかしな範囲で add_slider を呼び、ValueError になれば True を返す
+#   controls: スライダーを足そうとする窓（ValueError なら何も足されない）
+#   minimum, maximum, initial, step_count: add_slider に渡す範囲
+# 例: add_slider_raises_value_error(controls, 1.0, 1.0, 1.0, 10) == True
+fn add_slider_raises_value_error(mut controls: sp.SliderWindow, let minimum: float, let maximum: float, let initial: float, let step_count: int) -> bool:
+    try:
+        controls.add_slider("invalid", minimum, maximum, initial, set_curvature, step_count)
+    except ValueError:
+        return True
+    return False
+
+# check_adding_sliders — 1. スライダーを 2 本足し、番号・本数・最初の値を確かめる
+#   controls: 空の窓
+#   戻り値: (曲率のスライダーの番号, 頂点の数のスライダーの番号)
+# 例: let curvature_index, let node_count_index = check_adding_sliders(controls)
+fn check_adding_sliders(mut controls: sp.SliderWindow) -> tuple[int, int]:
+    expect_true(controls.is_open(), "is_open after creation")
+    let curvature_index = controls.add_slider("curvature [1/px]", CURVATURE_MINIMUM, CURVATURE_MAXIMUM, curvature, set_curvature)
+    let node_count_index = controls.add_slider("node count", NODE_COUNT_MINIMUM, NODE_COUNT_MAXIMUM, 3.2, set_node_count, NODE_COUNT_STEP_COUNT)
+    expect_true(curvature_index == 0 and node_count_index == 1, "add_slider returns 0, 1 in order")
+    expect_true(controls.slider_count() == 2, "slider_count after two add_slider")
+    expect_true(controls.get_value(curvature_index) == 0.005, "initial value on a step stays the same (0.005)")
+    expect_true(controls.get_value(node_count_index) == 3.0, "initial value 3.2 snaps to the nearest step 3.0")
+    controls.apply_changes()
+    expect_true(curvature_change_count == 0 and curvature == 0.005 and node_count == 3, "add_slider alone does not call on_change")
+    return (curvature_index, node_count_index)
+
+# check_moving_sliders — 2. スライダーを動かし、apply_changes で mut 変数が書き換わることを確かめる
+#   controls: check_adding_sliders の後の窓
+#   curvature_index, node_count_index: スライダーの番号
+# 例: check_moving_sliders(controls, 0, 1)
+fn check_moving_sliders(mut controls: sp.SliderWindow, let curvature_index: int, let node_count_index: int) -> None:
+    controls.move_slider(curvature_index, 0.002)
+    expect_true(curvature == 0.005, "the variable does not change before apply_changes")
+    controls.apply_changes()
+    expect_true(curvature == 0.002 and curvature_change_count == 1, "apply_changes sets curvature to 0.002 (one call)")
+    expect_true(curvature == controls.get_value(curvature_index), "the variable equals get_value after apply_changes")
+    expect_true(node_count == 3, "the other slider's variable is unchanged")
+
+    controls.move_slider(curvature_index, 0.0021234)
+    controls.apply_changes()
+    expect_true(curvature == 0.00212, "a value between steps goes to the nearest step (0.00212)")
+
+    controls.move_slider(curvature_index, 1.0)
+    controls.apply_changes()
+    expect_true(curvature == CURVATURE_MAXIMUM, "a value above the range goes to maximum")
+
+    let change_count_before_same_position = curvature_change_count
+    controls.move_slider(curvature_index, CURVATURE_MAXIMUM)
+    controls.apply_changes()
+    expect_true(curvature_change_count == change_count_before_same_position, "moving to the same position does not call on_change")
+
+    controls.move_slider(curvature_index, -0.004)
+    controls.move_slider(curvature_index, -0.006)
+    controls.apply_changes()
+    expect_true(curvature == -0.006, "two moves before apply_changes: the last value remains")
+    expect_true(curvature_change_count == change_count_before_same_position + 2, "two moves before apply_changes: both are applied")
+
+    controls.move_slider(node_count_index, 7.0)
+    controls.apply_changes()
+    expect_true(node_count == 7 and curvature == -0.006, "the int slider sets only node_count (7)")
+
+# check_invalid_arguments — 3. おかしな引数が Arrow の例外になることを確かめる（スライダーは増えない）
+#   controls: スライダーが 2 本の窓
+# 例: check_invalid_arguments(controls)
+fn check_invalid_arguments(mut controls: sp.SliderWindow) -> None:
+    expect_true(add_slider_raises_value_error(controls, 1.0, 1.0, 1.0, 10), "minimum == maximum is ValueError")
+    expect_true(add_slider_raises_value_error(controls, 2.0, 1.0, 1.5, 10), "minimum > maximum is ValueError")
+    expect_true(add_slider_raises_value_error(controls, 0.0, 1.0, 1.5, 10), "initial outside the range is ValueError")
+    expect_true(add_slider_raises_value_error(controls, 0.0, float("inf"), 0.5, 10), "an infinite maximum is ValueError")
+    expect_true(add_slider_raises_value_error(controls, 0.0, 1.0, 0.5, 0), "step_count 0 is ValueError")
+    expect_true(controls.slider_count() == 2, "invalid add_slider adds nothing")
+    mut raised_index_error = False
+    try:
+        controls.move_slider(2, 0.0)
+    except IndexError:
+        raised_index_error = True
+    expect_true(raised_index_error, "move_slider with an index out of range is IndexError")
+
+# check_closing — 4. 窓を閉じた後の振る舞いを確かめる
+#   controls: スライダーが 2 本の開いた窓（曲率のスライダーは -0.006 の位置）
+#   curvature_index: 曲率のスライダーの番号
+# 例: check_closing(controls, 0)
+fn check_closing(mut controls: sp.SliderWindow, let curvature_index: int) -> None:
+    controls.close()
+    expect_true(not controls.is_open(), "is_open is False after close")
+    controls.close()
+    expect_true(controls.get_value(curvature_index) == -0.006, "get_value after close returns the last value")
+    mut raised_on_add = False
+    try:
+        controls.add_slider("late", 0.0, 1.0, 0.5, set_curvature)
+    except RuntimeError:
+        raised_on_add = True
+    expect_true(raised_on_add, "add_slider after close is RuntimeError")
+    mut raised_on_move = False
+    try:
+        controls.move_slider(curvature_index, 0.0)
+    except RuntimeError:
+        raised_on_move = True
+    expect_true(raised_on_move, "move_slider after close is RuntimeError")
+
+
+mut controls = sp.SliderWindow("test_slider_panel", False)
+let curvature_index, let node_count_index = check_adding_sliders(controls)
+check_moving_sliders(controls, curvature_index, node_count_index)
+check_invalid_arguments(controls)
+check_closing(controls, curvature_index)
+print("all slider_panel checks passed")

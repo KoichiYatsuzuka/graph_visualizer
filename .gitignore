@@ -4,3 +4,10 @@
 # raylib_bridge のビルド成果物（raylib_bridge/build.ps1 が作る）
 /raylib_bridge/build/
 /raylib_bridge/raylib_bridge.dll
+
+# slider_panel のビルド成果物（slider_panel/build.ps1 が作る）
+/slider_panel/bin/
+/slider_panel/obj/
+/slider_panel/ArrowExports.g.cs
+/slider_panel/SliderPanelBridge.dll
+/slider_panel/SliderPanelBridge_native.dll

@@ -2,6 +2,7 @@ import environment as env
 import chemical_graphs as cg
 import[cpp-dll] raylib_bridge.raylib_bridge as rl
 import raylib_bridge.raylib_consts as rlc
+import slider_panel as sp
 
 mut vacancy = cg.Adsorbate(
     name = "vacancy",
@@ -30,6 +31,22 @@ mut proton = cg.Solute(
     is_const = True
 )
 
+# 矢印の形（スライダーの窓 controls から書き換える）
+mut arrow_curvature = 0.005     # 矢印の曲率 [1/pixel]（0 で直線・正なら進む向きに見て左へ曲がる）
+mut arrow_thickness = 6.0       # 矢印の軸の太さ [pixel]
+
+# set_arrow_curvature — 曲率のスライダーが動いたときに controls.apply_changes() から呼ばれ、arrow_curvature を書き換える
+#   value: スライダーの新しい値 [1/pixel]
+# 例: set_arrow_curvature(0.002)
+fn set_arrow_curvature(let value: float) -> None:
+    arrow_curvature = value
+
+# set_arrow_thickness — 太さのスライダーが動いたときに controls.apply_changes() から呼ばれ、arrow_thickness を書き換える
+#   value: スライダーの新しい値 [pixel]
+# 例: set_arrow_thickness(8.0)
+fn set_arrow_thickness(let value: float) -> None:
+    arrow_thickness = value
+
 
 # draw_species_label — 化学種の名前と量を 1 行の文字で描く（begin_drawing と end_drawing の間で呼ぶ）
 #   species: 描く化学種（Adsorbate / Solute）
@@ -44,9 +61,14 @@ rl.set_config_flags(rlc.FLAG_MSAA_4X_HINT)
 rl.init_window(800, 600, "graph_visualizer".encode("utf-8"))
 rl.set_target_fps(60)
 
+mut controls = sp.SliderWindow("graph_visualizer controls")
+controls.add_slider("curvature [1/px]", -0.01, 0.01, arrow_curvature, set_arrow_curvature)
+controls.add_slider("thickness [px]", 1.0, 20.0, arrow_thickness, set_arrow_thickness, 190)
+
 mut running = True
 
 while running:
+    controls.apply_changes()        # 前のフレームから動いたスライダーの分だけ set_arrow_* が呼ばれる
     rl.begin_drawing()
     rl.clear_background(rl.Color(245, 245, 245, 255))
     rl.draw_text("graph_visualizer".encode("utf-8"), 20, 20, 24, rl.Color(40, 40, 40, 255))
@@ -57,15 +79,16 @@ while running:
     rl.draw_filled_circle(100.0, 120.0, 30.0, rl.Color(200, 20, 20, 255))
     rl.draw_filled_circle(300.0, 320.0, 30.0, rl.Color(20, 20, 200, 255))
     #rl.draw_curved_arrow(180.0, 120.0, 380.0, 320.0, 6.0, rl.Color(200, 20, 20, 255), rl.Color(20, 20, 200, 255), 0.005)
-    rl.draw_curved_arrow_flowing(180.0, 120.0, 380.0, 320.0, 6.0,
+    rl.draw_curved_arrow_flowing(180.0, 120.0, 380.0, 320.0, arrow_thickness,
         rl.Color(255, 200, 200, 255),   # start_color：始点（淡い色）
         rl.Color(230, 41, 55, 255),     # middle_color：軸の長さのちょうど半分
         rl.Color(90, 0, 20, 255),       # end_color：矢じりの付け根。矢じりもこの色
-        0.005,
+        arrow_curvature,
         rl.get_time()/6
     )
     rl.end_drawing()
     running = not rl.window_should_close()
 
+controls.close()
 rl.close_window()
 

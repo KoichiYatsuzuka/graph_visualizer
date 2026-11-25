@@ -1,0 +1,163 @@
+# slider_panel — C#（WinForms）のスライダーの窓から、Arrow の mut 変数を書き換える
+#
+# 使い方（main.ar のようにリポジトリのルートのファイルから）:
+#     import slider_panel as sp
+#
+#     mut arrow_curvature = 0.005
+#     fn set_arrow_curvature(let value: float) -> None:     # スライダーが動いたら呼ばれる
+#         arrow_curvature = value
+#
+#     mut controls = sp.SliderWindow("controls")
+#     controls.add_slider("curvature [1/px]", -0.01, 0.01, arrow_curvature, set_arrow_curvature)
+#     while running:
+#         controls.apply_changes()      # 前回からスライダーが動いた分だけ set_arrow_curvature が呼ばれる
+#         ...                           # arrow_curvature を使って描く
+#     controls.close()
+#
+# 仕組み（Arrow の外部イベント・test_lang/docs/grammar/11_events.md）:
+#   1. add_slider は Signal[str] を作り、その external_id を C# の窓（SliderPanelBridge.SliderPanel）へ渡す。
+#      Signal には「受け取った文字列を float にして on_change へ渡す」ハンドラを付ける
+#   2. 利用者がスライダーを動かすと、C# の UI スレッドが ar_event_fire で Arrow のキューに新しい値を積む
+#   3. Arrow のメインスレッドが apply_changes（= EventLoop.run(0.0)）を呼ぶと、積まれた順にハンドラが走り、
+#      on_change が mut 変数へ代入する。Arrow の変数は Arrow のメインスレッドでしか書き換わらない
+#
+# 前提: slider_panel/build.ps1 で SliderPanelBridge.dll と SliderPanelBridge_native.dll を作ってあること。
+
+import[cs-dll] .SliderPanelBridge as bridge
+
+const DEFAULT_STEP_COUNT = 1000
+
+# is_finite_number — value が有限の数か（NaN・正負の無限大でない）
+#   value:  調べる数
+#   戻り値: 有限なら True
+# 例: is_finite_number(1.0) == True、is_finite_number(float("inf")) == False
+fn is_finite_number(let value: float) -> bool:
+    return value == value and abs(value) != float("inf")
+
+# check_slider_range — add_slider の範囲の引数を確かめ、おかしければ ValueError を投げる
+#   minimum, maximum: スライダーの両端の値（有限で minimum < maximum）
+#   initial:          最初の値（minimum 以上 maximum 以下）
+#   step_count:       両端の間の刻みの数（1 以上）
+# 例: check_slider_range(-0.01, 0.01, 0.005, 1000)   # 何も起きない
+fn check_slider_range(let minimum: float, let maximum: float, let initial: float, let step_count: int) -> None:
+    if not (is_finite_number(minimum) and is_finite_number(maximum) and minimum < maximum):
+        raise ValueError("slider range must be finite with minimum < maximum, got " + str(minimum) + " .. " + str(maximum))
+    if not (initial >= minimum and initial <= maximum):
+        raise ValueError("initial " + str(initial) + " is outside the slider range " + str(minimum) + " .. " + str(maximum))
+    if step_count < 1:
+        raise ValueError("step_count must be 1 or more, got " + str(step_count))
+
+# SliderWindow — スライダーを並べた C# の窓。スライダーごとに、動いたときに呼ぶ Arrow の関数（on_change）を持つ
+#
+# 窓は C# の別スレッドで動くので、Arrow のループは止まらない。スライダーが動いた事実は Arrow のキューに溜まり、
+# apply_changes を呼んだときに on_change が Arrow のメインスレッドで呼ばれる。
+#
+# メンバー:
+#   panel: bridge.SliderPanel — C# の窓（private）
+#   slider_total: int         — 足したスライダーの本数（private。番号の検査に使う）
+#   add_slider(label, minimum, maximum, initial, on_change, step_count) -> int — スライダーを足して番号を返す
+#   apply_changes()           — 前回からスライダーが動いた分の on_change を、動いた順に呼ぶ
+#   get_value(index) -> float — スライダーの今の値（on_change を待たずに読む）
+#   move_slider(index, value) — 利用者が動かしたのと同じくスライダーを動かす（apply_changes で on_change が呼ばれる）
+#   slider_count() -> int     — スライダーの本数
+#   is_open() -> bool         — 窓が開いているか（利用者が閉じるボタンを押すと False）
+#   close()                   — 窓を閉じる（何度呼んでもよい）
+#
+# 例:
+#   mut controls = SliderWindow("controls")
+#   let index = controls.add_slider("thickness [px]", 1.0, 20.0, 6.0, set_thickness, 190)
+#   controls.apply_changes()
+class SliderWindow:
+    private:
+    let panel: bridge.SliderPanel
+    mut slider_total: int
+
+    public:
+    # __init__ — 窓を作る（窓ができるまで待って戻る）
+    #   title:   窓のタイトル
+    #   visible: True なら表示する。False なら表示しない（自動テスト用。スライダーは足せるし動かせる）
+    # 例: mut controls = SliderWindow("graph_visualizer controls")
+    fn __init__(mut self, let title: str, let visible: bool = True) -> Self:
+        self.panel = bridge.SliderPanel(title, visible)
+        self.slider_total = 0
+        return self
+
+    # add_slider — スライダーを 1 本足す。足しただけでは on_change は呼ばない
+    #   label:      スライダーの左に出す名前
+    #   minimum:    左端の値（有限で maximum より小さい）
+    #   maximum:    右端の値（有限）
+    #   initial:    最初の位置の値（minimum 以上 maximum 以下。ふつうは書き換える mut 変数の今の値。
+    #               最も近い刻みに置く）
+    #   on_change:  スライダーが動いたときに新しい値で呼ぶ関数。mut 変数へ代入する関数を渡す。
+    #               int の変数なら関数の中で int(round(value)) にする
+    #   step_count: minimum から maximum までの刻みの数（1 以上）。値の細かさは (maximum - minimum) / step_count。
+    #               値は刻みの位置の値だけになる（整数にするなら maximum - minimum を渡す）
+    #   戻り値: スライダーの番号（足した順に 0, 1, 2, …。get_value・move_slider に渡す）
+    #   範囲の引数がおかしければ ValueError、窓が閉じていれば RuntimeError。
+    # 例: controls.add_slider("node count", 1.0, 10.0, 3.0, set_node_count, 9)
+    fn add_slider(mut self, let label: str, let minimum: float, let maximum: float, let initial: float, let on_change: function[let float]->None, let step_count: int = DEFAULT_STEP_COUNT) -> int:
+        check_slider_range(minimum, maximum, initial, step_count)
+        self.check_open()
+        let value_changed = Signal[str]()
+
+        # forward_value — C# から届いた値の文字列（"R" 書式・"1E-05" の形もある）を float にして on_change へ渡す
+        fn forward_value(let value_text: str) -> None:
+            on_change(float(value_text))
+
+        value_changed on forward_value
+        let slider_index = self.panel.AddSlider(label, minimum, maximum, initial, step_count, value_changed.external_id)
+        self.slider_total += 1
+        return slider_index
+
+    # apply_changes — 前回の呼び出しからスライダーが動いた分の on_change を、動いた順に呼ぶ（待たずに戻る）
+    #   描画ループの各フレームの初めに呼ぶ。中身は EventLoop.run(0.0) なので、ほかの Signal の emit_async の分も処理する。
+    #   on_change が投げた例外はここから出る。
+    # 例: controls.apply_changes()
+    fn apply_changes(let self) -> None:
+        EventLoop.run(0.0)
+
+    # get_value — スライダーの今の値（apply_changes を待たない。窓を閉じた後は閉じたときの値）
+    #   index: スライダーの番号（範囲外は IndexError）
+    # 例: let curvature_now = controls.get_value(0)
+    fn get_value(let self, let index: int) -> float:
+        self.check_index(index)
+        return self.panel.GetValue(index)
+
+    # move_slider — スライダーを value に最も近い刻みへ動かす。位置が変われば、利用者が動かしたときと同じく
+    #   次の apply_changes で on_change が呼ばれる（同じ位置なら何も起きない）
+    #   index: スライダーの番号（範囲外は IndexError）
+    #   value: 動かす先の値（範囲外なら端に寄せる。NaN は ValueError）
+    #   窓が閉じていれば RuntimeError。
+    # 例: controls.move_slider(0, 0.002)
+    fn move_slider(mut self, let index: int, let value: float) -> None:
+        self.check_index(index)
+        if value != value:
+            raise ValueError("move_slider value must not be NaN")
+        self.check_open()
+        self.panel.MoveSlider(index, value)
+
+    # slider_count — スライダーの本数
+    # 例: controls.slider_count() == 2
+    fn slider_count(let self) -> int:
+        return self.slider_total
+
+    # is_open — 窓が開いているか（利用者が閉じるボタンを押した後・close の後は False）
+    # 例: if not controls.is_open(): print("the control window was closed")
+    fn is_open(let self) -> bool:
+        return self.panel.IsOpen()
+
+    # close — 窓を閉じ、窓のスレッドが終わるのを待つ（何度呼んでもよい）
+    # 例: controls.close()
+    fn close(mut self) -> None:
+        self.panel.Close()
+
+    private:
+    # check_open — 窓が閉じていれば RuntimeError を投げる
+    fn check_open(let self) -> None:
+        if not self.panel.IsOpen():
+            raise RuntimeError("the slider window is closed")
+
+    # check_index — スライダーの番号が範囲外なら IndexError を投げる
+    fn check_index(let self, let index: int) -> None:
+        if index < 0 or index >= self.slider_total:
+            raise IndexError("slider index " + str(index) + " is out of range (" + str(self.slider_total) + " sliders)")
