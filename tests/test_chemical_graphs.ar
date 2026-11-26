@@ -1,0 +1,244 @@
+# test_chemical_graphs.ar — chemical_graphs の化学種を円として描く機能（大きさ・クリックの判定・描画・印）を確かめる自動テスト
+#
+# 実行: arrow tests/test_chemical_graphs.ar（tests/run_tests.ps1 が tests/test_*.ar をまとめて走らせる）
+# 前提: raylib_bridge/install_raylib.ps1 → raylib_bridge/build.ps1 で raylib_bridge.dll を作ってあること。
+#
+# 見ること:
+#   1. 半径: quantity 1 で 100、1/10 ごとに半分（0.1 → 50・0.01 → 25・0.001 → 12.5）、下限 10（0 以下も 10）、
+#      1 より大きい量は 100 より大きい。NaN・正の無限大は ValueError
+#   2. 位置: Position（窓に対する割合）を窓のピクセルに換算できる
+#   3. クリックの判定: 円の中・外、重なった円では最も手前（並びの後ろ）の化学種、どれにも重ならなければ None
+#   4. 文字の色・印の位置: 明るい塗りには濃い文字、暗い塗りには白い文字、円からはみ出す行は背景に合わせる。
+#      印は円の上、窓の上にはみ出すなら円の下
+#   5. 描画（非表示の窓で画素を読み戻す）: 円の色・名前と量の文字・クリックされた印（印を付けた化学種にだけ・None なら無し）、
+#      範囲外の番号は IndexError
+# 期待と違えば RuntimeError を raise して非 0 で終わる。
+
+# ⚠ rl は cg より先に import する。raylib_bridge を import するモジュール（cg）を先に import すると、このファイルで構造体を
+#   返す関数（read_screen_pixel など）を呼んだところで NameError: 'Color' is not defined になる（Arrow 0.7.2・2026-11-26 実測）
+import[cpp-dll] ..raylib_bridge.raylib_bridge as rl
+import ..raylib_bridge.raylib_consts as rlc
+import ..chemical_graphs as cg
+
+const WINDOW_WIDTH = 800
+const WINDOW_HEIGHT = 600
+const FRAME_COUNT = 3                 # 最後のフレームで画素を確かめる
+const RADIUS_TOLERANCE = 1e-9         # 半径の浮動小数点の誤差の許容 [pixel]
+
+let BACKGROUND_COLOR = cg.CANVAS_BACKGROUND_COLOR    # 円からはみ出す文字の色はこの背景に合わせて選ばれる
+let BLUE_COLOR = rl.Color(0, 121, 241, 255)       # 暗い塗り（白い文字）
+let ORANGE_COLOR = rl.Color(255, 161, 0, 255)     # 明るい塗り（濃い文字）
+
+# ---- 描画の確認に使う場面（窓 800 x 600）----
+# 青い Solute "H2":   quantity 1.0  → 半径 100、中心 (200, 300)
+# 橙の Adsorbate "H_ads": quantity 0.01 → 半径 25、中心 (600, 300)（名前は円からはみ出す）
+# 青い Adsorbate "vacancy": quantity 0.0 → 半径 10（下限）、中心 (400, 90)（名前は明るい背景へはみ出す）
+const SCENE_NAME_ROW = 291            # 名前の行の中ほどの y（上端 300 - (20 + 2 + 16) // 2 = 281 に 20 // 2 を足す）
+const SCENE_BLUE_MARK_ROW = 186       # 青い円の印の行の中ほどの y（上端 300 - 100 - 4 - 20 = 176 に 20 // 2 を足す）
+const SCENE_ORANGE_MARK_ROW = 261     # 橙の円に印を描いたときの行の中ほどの y（上端 300 - 25 - 4 - 20 = 251 に 10 を足す）
+const SCENE_VACANCY_NAME_ROW = 81     # vacancy の名前の行の中ほどの y（上端 90 - 19 = 71 に 10 を足す）
+
+# expect_true — 条件が偽なら RuntimeError を投げ、真なら OK を表示する
+#   condition: 確かめる条件
+#   label:     表示とエラーメッセージに出す説明
+# 例: expect_true(cg.radius_for_quantity(1.0) == 100.0, "radius at quantity 1")
+fn expect_true(let condition: bool, let label: str) -> None:
+    if not condition:
+        raise RuntimeError("FAILED: " + label)
+    print("OK:", label)
+
+# expect_close — 2 つの float の差が tolerance 以下か確かめる
+#   actual, expected: 比べる値
+#   tolerance: 許容する差
+#   label: 表示とエラーメッセージに出す説明
+# 例: expect_close(cg.radius_for_quantity(0.1), 50.0, RADIUS_TOLERANCE, "radius at quantity 0.1")
+fn expect_close(let actual: float, let expected: float, let tolerance: float, let label: str) -> None:
+    expect_true(abs(actual - expected) <= tolerance, label + ": " + str(actual) + " (expected " + str(expected) + ")")
+
+# radius_raises_value_error — radius_for_quantity が ValueError を投げれば True を返す
+#   quantity: 渡す量
+#   戻り値: ValueError なら True、値が返れば False
+# 例: radius_raises_value_error(float("nan")) == True
+fn radius_raises_value_error(let quantity: float) -> bool:
+    try:
+        let _ = cg.radius_for_quantity(quantity)
+    except ValueError:
+        return True
+    return False
+
+# found_index_is — find_species_at の戻り値が expected の番号か（Option[int] は int と直接 == で比べられない）
+#   found:    find_species_at の戻り値
+#   expected: 期待する番号
+#   戻り値: found が None でなく expected と等しければ True
+# 例: found_index_is(cg.find_species_at(species_list, point, 800, 600), 1)
+fn found_index_is(let found: Option[int], let expected: int) -> bool:
+    if found is not None:
+        return found == expected
+    return False
+
+# same_rgb — 2 つの色の r, g, b が等しいか（read_screen_pixel のアルファは常に 255 なので比べない）
+#   actual, expected: 比べる色
+#   戻り値: r, g, b がすべて等しければ True
+# 例: same_rgb(rl.Color(1, 2, 3, 255), rl.Color(1, 2, 3, 0)) == True
+fn same_rgb(let actual: rl.Color, let expected: rl.Color) -> bool:
+    return actual.r == expected.r and actual.g == expected.g and actual.b == expected.b
+
+# expect_pixel — 今のフレームの画素 (x, y) が期待の色か確かめる（begin_drawing と end_drawing の間で呼ぶ）
+#   x, y:     画素の位置（ウィンドウの左上が (0, 0)）
+#   expected: 期待する色
+#   label:    表示とエラーメッセージに出す説明
+# 例: expect_pixel(270, 300, BLUE_COLOR, "inside the blue circle")
+fn expect_pixel(let x: int, let y: int, let expected: rl.Color, let label: str) -> None:
+    let actual = rl.read_screen_pixel(x, y) mustbe rl.Color
+    let color_text = str(actual.r) + "," + str(actual.g) + "," + str(actual.b)
+    expect_true(same_rgb(actual, expected), label + ": pixel (" + str(x) + ", " + str(y) + ") is " + color_text)
+
+# count_pixels_like — 横 1 行の区間 [x_start, x_end) で、色が target から各チャンネル tolerance 以内の画素を数える
+#   y:              行の位置
+#   x_start, x_end: 数える区間（x_end は含まない）
+#   target:         探す色（文字の色など）
+#   tolerance:      各チャンネルの許容差（文字の縁のにじみを含めるため）
+#   戻り値: 当てはまる画素の数
+# 例: count_pixels_like(SCENE_NAME_ROW, 170, 230, cg.LIGHT_LABEL_COLOR, 60)   # 青い円の中の白い名前の画素
+fn count_pixels_like(let y: int, let x_start: int, let x_end: int, let target: rl.Color, let tolerance: int) -> int:
+    mut matched_count = 0
+    mut x = x_start
+    while x < x_end:
+        let pixel = rl.read_screen_pixel(x, y) mustbe rl.Color
+        let channel_gap = max(abs(pixel.r - target.r), abs(pixel.g - target.g), abs(pixel.b - target.b))
+        if channel_gap <= tolerance:
+            matched_count += 1
+        x += 1
+    return matched_count
+
+# scene_species — 描画の確認に使う化学種の並び（青い Solute "H2"、橙の Adsorbate "H_ads"、青い Adsorbate "vacancy"。後ろほど手前）
+#   戻り値: [H2, H_ads, vacancy]
+# 例: cg.draw_species_list(scene_species(), 0, WINDOW_WIDTH, WINDOW_HEIGHT)
+fn scene_species() -> list[cg.Species]:
+    let h2 = cg.Solute(name = "H2", pos = cg.Position(0.25, 0.5), quantity = 1.0, color = BLUE_COLOR, is_const = True)
+    let h_ads = cg.Adsorbate(name = "H_ads", pos = cg.Position(0.75, 0.5), quantity = 0.01, color = ORANGE_COLOR)
+    let vacancy = cg.Adsorbate(name = "vacancy", pos = cg.Position(0.5, 0.15), quantity = 0.0, color = BLUE_COLOR)
+    let scene: list[cg.Species] = [h2, h_ads, vacancy]
+    return scene
+
+# check_radius — 1. 量から半径を決める規則を確かめる
+# 例: check_radius()
+fn check_radius() -> None:
+    expect_close(cg.radius_for_quantity(1.0), 100.0, RADIUS_TOLERANCE, "radius at quantity 1 is 100")
+    expect_close(cg.radius_for_quantity(0.1), 50.0, RADIUS_TOLERANCE, "radius at quantity 0.1 is 50")
+    expect_close(cg.radius_for_quantity(0.01), 25.0, RADIUS_TOLERANCE, "radius at quantity 0.01 is 25")
+    expect_close(cg.radius_for_quantity(0.001), 12.5, RADIUS_TOLERANCE, "radius at quantity 0.001 is 12.5")
+    expect_close(cg.radius_for_quantity(0.05), cg.radius_for_quantity(0.5) / 2.0, RADIUS_TOLERANCE, "radius halves when quantity becomes 1/10 (0.5 -> 0.05)")
+    expect_true(cg.radius_for_quantity(0.0001) == 10.0, "radius at quantity 0.0001 (6.25) is raised to the minimum 10")
+    expect_true(cg.radius_for_quantity(0.0) == 10.0, "radius at quantity 0 is the minimum 10")
+    expect_true(cg.radius_for_quantity(-0.5) == 10.0, "radius at a negative quantity is the minimum 10")
+    expect_close(cg.radius_for_quantity(10.0), 200.0, RADIUS_TOLERANCE, "radius at quantity 10 is 200 (no upper limit)")
+    expect_true(radius_raises_value_error(float("nan")), "radius at quantity NaN is ValueError")
+    expect_true(radius_raises_value_error(float("inf")), "radius at quantity +inf is ValueError")
+
+# check_position — 2. 窓に対する割合の位置を窓のピクセルに換算できることを確かめる
+# 例: check_position()
+fn check_position() -> None:
+    let point = cg.Position(0.1, 0.9).to_screen(WINDOW_WIDTH, WINDOW_HEIGHT)
+    expect_true(point.x == 80.0 and point.y == 540.0, "Position(0.1, 0.9) is (80, 540) in an 800 x 600 window")
+
+# check_hit_test — 3. クリックした点が円に重なるかの判定と、最も手前の化学種の選び方を確かめる
+# 例: check_hit_test()
+fn check_hit_test() -> None:
+    # 半径 50（quantity 0.1）、中心 (400, 300)
+    let medium = cg.Adsorbate(name = "medium", pos = cg.Position(0.5, 0.5), quantity = 0.1, color = ORANGE_COLOR)
+    expect_true(medium.get_quantity() == 0.1, "get_quantity still returns the quantity")
+    expect_true(medium.contains_screen_point(rl.Vector2(400.0, 300.0), WINDOW_WIDTH, WINDOW_HEIGHT), "the center is inside")
+    expect_true(medium.contains_screen_point(rl.Vector2(449.0, 300.0), WINDOW_WIDTH, WINDOW_HEIGHT), "49 px to the right of the center is inside (radius 50)")
+    expect_true(medium.contains_screen_point(rl.Vector2(435.0, 335.0), WINDOW_WIDTH, WINDOW_HEIGHT), "49.5 px diagonally is inside")
+    expect_true(not medium.contains_screen_point(rl.Vector2(451.0, 300.0), WINDOW_WIDTH, WINDOW_HEIGHT), "51 px to the right of the center is outside")
+    expect_true(not medium.contains_screen_point(rl.Vector2(436.0, 336.0), WINDOW_WIDTH, WINDOW_HEIGHT), "50.9 px diagonally is outside")
+
+    # 大きい円（半径 100・中心 (400, 300)）の上に、小さい円（半径 12.5・中心 (440, 300)）が重なる
+    let large = cg.Solute(name = "large", pos = cg.Position(0.5, 0.5), quantity = 1.0, color = BLUE_COLOR, is_const = True)
+    let small = cg.Adsorbate(name = "small", pos = cg.Position(0.55, 0.5), quantity = 0.001, color = ORANGE_COLOR)
+    let small_in_front: list[cg.Species] = [large, small]
+    let large_in_front: list[cg.Species] = [small, large]
+    let empty_list: list[cg.Species] = []
+    let overlap_point = rl.Vector2(440.0, 300.0)
+    expect_true(found_index_is(cg.find_species_at(small_in_front, overlap_point, WINDOW_WIDTH, WINDOW_HEIGHT), 1), "a point on both circles picks the front one (last in the list)")
+    expect_true(found_index_is(cg.find_species_at(large_in_front, overlap_point, WINDOW_WIDTH, WINDOW_HEIGHT), 1), "the front one follows the list order")
+    expect_true(found_index_is(cg.find_species_at(small_in_front, rl.Vector2(330.0, 300.0), WINDOW_WIDTH, WINDOW_HEIGHT), 0), "a point only on the large circle picks it")
+    expect_true(cg.find_species_at(small_in_front, rl.Vector2(10.0, 10.0), WINDOW_WIDTH, WINDOW_HEIGHT) is None, "a point on no circle gives None")
+    expect_true(cg.find_species_at(empty_list, overlap_point, WINDOW_WIDTH, WINDOW_HEIGHT) is None, "an empty list gives None")
+
+# check_label_color_and_mark_position — 4. 文字の色の選び方と、印の行の位置を確かめる（measure_text を使うので init_window の後に呼ぶ）
+# 例: check_label_color_and_mark_position()
+fn check_label_color_and_mark_position() -> None:
+    expect_true(same_rgb(cg.label_color_on(ORANGE_COLOR), cg.DARK_LABEL_COLOR), "a bright fill (orange) gets dark text")
+    expect_true(same_rgb(cg.label_color_on(BLUE_COLOR), cg.LIGHT_LABEL_COLOR), "a dark fill (blue) gets white text")
+    expect_true(cg.highlight_mark_top(300.0, 100.0) == 176, "the mark sits above the circle (top 176)")
+    expect_true(cg.highlight_mark_top(50.0, 100.0) == 154, "the mark goes below the circle when it would leave the window (top 154)")
+    expect_true(same_rgb(cg.label_color_for_line("H2", 20, 100.0, BLUE_COLOR), cg.LIGHT_LABEL_COLOR), "a line inside a dark circle gets white text")
+    expect_true(same_rgb(cg.label_color_for_line("vacancy", 20, 10.0, BLUE_COLOR), cg.DARK_LABEL_COLOR), "a line wider than the circle follows the light background (dark text)")
+
+# check_drawn_scene — 5. scene_species を描いたフレームの画素を確かめる（draw_species_list の直後、end_drawing の前に呼ぶ）
+#   highlighted_index: draw_species_list に渡した印の番号（0 = 青い H2 に印・None = 印なし）
+# 例: check_drawn_scene(0)
+fn check_drawn_scene(let highlighted_index: Option[int]) -> None:
+    let case_text = " (highlighted_index " + str(highlighted_index) + ")"
+    expect_pixel(270, 300, BLUE_COLOR, "the blue circle is filled with its color" + case_text)
+    expect_pixel(200, 210, BLUE_COLOR, "the blue circle reaches 90 px above the center (radius 100)" + case_text)
+    expect_pixel(305, 300, BACKGROUND_COLOR, "nothing is drawn 105 px right of the blue center" + case_text)
+    expect_pixel(600, 278, ORANGE_COLOR, "the orange circle (radius 25) is filled above its label" + case_text)
+    expect_pixel(628, 300, BACKGROUND_COLOR, "nothing is drawn 28 px right of the orange center" + case_text)
+    expect_true(count_pixels_like(SCENE_NAME_ROW, 170, 230, cg.LIGHT_LABEL_COLOR, 60) > 0, "the name is drawn in white on the blue circle" + case_text)
+    expect_true(count_pixels_like(SCENE_NAME_ROW, 560, 640, cg.DARK_LABEL_COLOR, 60) > 0, "the name is drawn in dark gray on the orange circle" + case_text)
+    expect_true(count_pixels_like(SCENE_NAME_ROW + 20, 170, 230, cg.LIGHT_LABEL_COLOR, 60) > 0, "the quantity is drawn under the name" + case_text)
+    expect_true(count_pixels_like(SCENE_VACANCY_NAME_ROW, 350, 450, cg.DARK_LABEL_COLOR, 60) > 0, "a name wider than a dark circle is drawn dark on the light background" + case_text)
+    let blue_mark_count = count_pixels_like(SCENE_BLUE_MARK_ROW, 140, 260, cg.HIGHLIGHT_MARK_COLOR, 60)
+    let orange_mark_count = count_pixels_like(SCENE_ORANGE_MARK_ROW, 540, 660, cg.HIGHLIGHT_MARK_COLOR, 60)
+    if highlighted_index is None:
+        expect_true(blue_mark_count == 0 and orange_mark_count == 0, "no mark is drawn" + case_text)
+    else:
+        expect_true(blue_mark_count > 0, "the mark is drawn above the highlighted circle" + case_text)
+        expect_true(orange_mark_count == 0, "no mark above the other circle" + case_text)
+
+# draw_scene_frames — scene_species を FRAME_COUNT フレーム描き、最後のフレームで check_drawn_scene を呼ぶ
+#   highlighted_index: draw_species_list に渡す印の番号
+# 例: draw_scene_frames(None)
+fn draw_scene_frames(let highlighted_index: Option[int]) -> None:
+    mut frame_index = 0
+    while frame_index < FRAME_COUNT:
+        rl.begin_drawing()
+        rl.clear_background(BACKGROUND_COLOR)
+        cg.draw_species_list(scene_species(), highlighted_index, WINDOW_WIDTH, WINDOW_HEIGHT)
+        if frame_index == FRAME_COUNT - 1:
+            check_drawn_scene(highlighted_index)
+        rl.end_drawing()
+        frame_index += 1
+
+# check_index_out_of_range — draw_species_list に範囲外の番号を渡すと IndexError になることを確かめる
+# 例: check_index_out_of_range()
+fn check_index_out_of_range() -> None:
+    mut raised_index_error = False
+    rl.begin_drawing()
+    rl.clear_background(BACKGROUND_COLOR)
+    try:
+        cg.draw_species_list(scene_species(), 3, WINDOW_WIDTH, WINDOW_HEIGHT)
+    except IndexError:
+        raised_index_error = True
+    rl.end_drawing()
+    expect_true(raised_index_error, "draw_species_list with highlighted_index out of range is IndexError")
+
+
+# ---- 本体 ----
+check_radius()
+check_position()
+check_hit_test()
+
+rl.set_trace_log_level(rlc.LOG_WARNING)
+rl.set_config_flags(rlc.FLAG_WINDOW_HIDDEN)
+rl.init_window(WINDOW_WIDTH, WINDOW_HEIGHT, "test_chemical_graphs".encode("utf-8"))
+rl.set_target_fps(60)
+check_label_color_and_mark_position()
+draw_scene_frames(0)
+draw_scene_frames(None)
+check_index_out_of_range()
+rl.close_window()
+print("all chemical_graphs checks passed")

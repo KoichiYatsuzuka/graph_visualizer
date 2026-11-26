@@ -1,12 +1,115 @@
 import ..environment as env
 import[cpp-dll] ..raylib_bridge.raylib_bridge as rl
 
+# ---- 化学種を円で描くときの大きさ・文字・印 ----
+const FULL_QUANTITY_RADIUS = 100.0          # quantity が 1 のときの円の半径 [pixel]
+const MINIMUM_RADIUS = 10.0                 # 円の半径の下限 [pixel]（quantity が小さくても、0 以下でもこれより小さくしない）
+const LOG10_OF_TWO = 0.30102999566398120    # log10(2)。半径 = FULL_QUANTITY_RADIUS * quantity ** LOG10_OF_TWO
+                                            # （= FULL_QUANTITY_RADIUS * 2 ** log10(quantity)。quantity が 1/10 になるごとに半分）
+const NAME_FONT_SIZE = 20                   # 円の中心に描く名前の文字の大きさ [pixel]
+const QUANTITY_FONT_SIZE = 16               # 名前の下に描く量の文字の大きさ [pixel]
+const LABEL_LINE_GAP = 2                    # 名前の行と量の行の間 [pixel]
+const QUANTITY_FORMAT = ".3g"               # 量の書式（format の書式指定。0.001 → "0.001"・1.0 → "1"）
+const LABEL_BRIGHTNESS_THRESHOLD = 150.0    # 塗りの明るさ（0〜255）がこれ以上なら濃い文字、未満なら白い文字にする
+const HIGHLIGHT_MARK_TEXT = "[clicked]"     # クリックされた化学種の円の上に描く印（raylib の既定のフォントは ASCII だけ）
+const HIGHLIGHT_MARK_FONT_SIZE = 20         # 印の文字の大きさ [pixel]
+const HIGHLIGHT_MARK_GAP = 4                # 円の縁と印の間 [pixel]
+
+let CANVAS_BACKGROUND_COLOR = rl.Color(245, 245, 245, 255)  # 化学種を描く窓の背景の色（円からはみ出す文字の色をこれに合わせて選ぶ）
+let DARK_LABEL_COLOR = rl.Color(30, 30, 30, 255)        # 明るい塗りの上の文字の色
+let LIGHT_LABEL_COLOR = rl.Color(255, 255, 255, 255)    # 暗い塗りの上の文字の色
+let HIGHLIGHT_MARK_COLOR = rl.Color(200, 0, 0, 255)     # クリックされた印の色
+
+# radius_for_quantity — 化学種の量から、描く円の半径 [pixel] を決める
+#   quantity: 化学種の量。1 で FULL_QUANTITY_RADIUS（100）、1/10 になるごとに半径は半分（0.1 で 50、0.01 で 25、0.001 で 12.5）
+#   戻り値: FULL_QUANTITY_RADIUS * 2 ** log10(quantity)。MINIMUM_RADIUS（10）より小さければ MINIMUM_RADIUS。
+#           quantity が 0 以下でも MINIMUM_RADIUS（log10 が決まらないので下限にする）。1 より大きい量は 100 より大きくなる（上限なし）
+#   NaN・正の無限大は ValueError（半径が決まらない）
+# 例: radius_for_quantity(0.1)  # 50.0（浮動小数点の誤差は 1e-12 程度）
+#     radius_for_quantity(0.0)  # 10.0
+fn radius_for_quantity(let quantity: float) -> float:
+    if quantity != quantity:
+        raise ValueError("quantity is NaN; the circle radius is undefined")
+    if quantity == float("inf"):
+        raise ValueError("quantity is infinite; the circle radius is undefined")
+    if quantity <= 0.0:
+        return MINIMUM_RADIUS
+    let scaled_radius = FULL_QUANTITY_RADIUS * quantity ** LOG10_OF_TWO
+    if scaled_radius < MINIMUM_RADIUS:
+        return MINIMUM_RADIUS
+    return scaled_radius
+
+# label_color_on — 塗りの色の上で読みやすい文字の色を返す（明るい塗りには濃い灰色、暗い塗りには白）
+#   fill_color: 文字の下の塗りの色
+#   戻り値: 明るさ 0.299 r + 0.587 g + 0.114 b が LABEL_BRIGHTNESS_THRESHOLD 以上なら DARK_LABEL_COLOR、未満なら LIGHT_LABEL_COLOR
+# 例: label_color_on(rl.Color(255, 161, 0, 255))   # DARK_LABEL_COLOR（橙は明るい）
+#     label_color_on(rl.Color(0, 121, 241, 255))   # LIGHT_LABEL_COLOR（青は暗い）
+fn label_color_on(let fill_color: rl.Color) -> rl.Color:
+    let brightness = 0.299 * fill_color.r + 0.587 * fill_color.g + 0.114 * fill_color.b
+    if brightness >= LABEL_BRIGHTNESS_THRESHOLD:
+        return DARK_LABEL_COLOR
+    return LIGHT_LABEL_COLOR
+
+# label_color_for_line — 円の中心に描く文字の 1 行の色を決める。行が円に収まれば塗りに合わせ、はみ出すなら窓の背景に合わせる
+#   （rl.measure_text を使うので init_window の後に呼ぶ）
+#   text:       行の文字（ASCII）
+#   font_size:  文字の大きさ [pixel]
+#   radius:     円の半径 [pixel]
+#   fill_color: 円の塗りの色
+#   戻り値: 行の幅が直径以下なら label_color_on(fill_color)、直径より広ければ label_color_on(CANVAS_BACKGROUND_COLOR)
+# 例: label_color_for_line("H2", 20, 100.0, rl.Color(0, 121, 241, 255))        # LIGHT_LABEL_COLOR（青い円に収まる）
+#     label_color_for_line("vacancy", 20, 10.0, rl.Color(0, 121, 241, 255))   # DARK_LABEL_COLOR（明るい背景へはみ出す）
+fn label_color_for_line(let text: str, let font_size: int, let radius: float, let fill_color: rl.Color) -> rl.Color:
+    let text_width = rl.measure_text(text.encode("utf-8"), font_size)
+    if text_width <= 2.0 * radius:
+        return label_color_on(fill_color)
+    return label_color_on(CANVAS_BACKGROUND_COLOR)
+
+# draw_centered_text — 文字の行を、横の中心が center_x、上端が top_y になるように描く（begin_drawing と end_drawing の間で呼ぶ）
+#   text:      描く文字（ASCII。raylib の既定のフォントは ASCII だけ）
+#   center_x:  行の横の中心 [pixel]
+#   top_y:     行の上端 [pixel]
+#   font_size: 文字の大きさ [pixel]
+#   color:     文字の色
+# 例: draw_centered_text("H2", 400.0, 290, 20, DARK_LABEL_COLOR)
+fn draw_centered_text(let text: str, let center_x: float, let top_y: int, let font_size: int, let color: rl.Color) -> None:
+    let text_bytes = text.encode("utf-8")
+    let text_width = rl.measure_text(text_bytes, font_size)
+    let left_x = int(round(center_x)) - text_width // 2
+    rl.draw_text(text_bytes, left_x, top_y, font_size, color)
+
+# highlight_mark_top — クリックされた印の行の上端を決める。円の上に置き、窓の上にはみ出すなら円の下に置く
+#   center_y: 円の中心の y [pixel]
+#   radius:   円の半径 [pixel]
+#   戻り値: 印の行の上端の y [pixel]
+# 例: highlight_mark_top(300.0, 100.0)   # 176（= 300 - 100 - HIGHLIGHT_MARK_GAP - HIGHLIGHT_MARK_FONT_SIZE）
+#     highlight_mark_top(50.0, 100.0)    # 154（上にはみ出すので円の下 = 50 + 100 + HIGHLIGHT_MARK_GAP）
+fn highlight_mark_top(let center_y: float, let radius: float) -> int:
+    let above_top = int(round(center_y - radius)) - HIGHLIGHT_MARK_GAP - HIGHLIGHT_MARK_FONT_SIZE
+    if above_top >= 0:
+        return above_top
+    return int(round(center_y + radius)) + HIGHLIGHT_MARK_GAP
+
+# Position — 化学種を描く位置。窓の大きさに対する割合で持つ（(0, 0) が左上、(1, 1) が右下）
+#   メンバー:
+#     x: float（private）— 横の位置。窓の幅に対する割合
+#     y: float（private）— 縦の位置。窓の高さに対する割合（下向きが正）
+#     to_screen(screen_width, screen_height) -> rl.Vector2 — 窓の中のピクセルの座標に換算する
+#     __cast__[rl.Position_CPP]() -> rl.Position_CPP — C++ 側の座標クラスへ写す
+# 例: let center = Position(0.5, 0.25).to_screen(800, 600)   # rl.Vector2(400.0, 150.0)
 class Position:
     private:
     mut x: float
     mut y: float
 
     public:
+    # to_screen — 窓の大きさに対する割合の位置を、窓の中のピクセルの座標（左上が (0, 0)）に換算する
+    #   screen_width, screen_height: 窓の幅・高さ [pixel]（rl.get_screen_width() / rl.get_screen_height()）
+    #   戻り値: rl.Vector2(x * screen_width, y * screen_height)
+    # 例: Position(0.1, 0.9).to_screen(800, 600)   # rl.Vector2(80.0, 540.0)
+    fn to_screen(let self, let screen_width: int, let screen_height: int) -> rl.Vector2:
+        return rl.Vector2(self.x * screen_width, self.y * screen_height)
+
     # __cast__[rl.Position_CPP] — C++ 側の座標クラス rl.Position_CPP へ変換する（`p => rl.Position_CPP` で呼ぶ）
     #   戻り値: x, y をそのまま写した rl.Position_CPP（float32 に丸められる。ピクセルへの換算はしない）
     #   ⚠ let 仮引数への自動キャストは効かない（キャスト先が C++ の型だと静的エラー・2026-11-24 実測）。=> を書く。
@@ -14,6 +117,20 @@ class Position:
     fn __cast__[rl.Position_CPP](let self) -> rl.Position_CPP:
         return rl.Position_CPP(self.x, self.y)
 
+# Species — 化学種。量（quantity）に応じた大きさの円として描き、クリックされた点が円に重なるかを判定できる
+#   メンバー:
+#     name: str（public・不変）— 化学種の名前（円の中心に描く。ASCII）
+#     quantity: float（protected）— 化学種の量。円の半径を決める（radius_for_quantity）
+#     pos: Position（protected）— 円の中心の位置（窓の大きさに対する割合）
+#     color: rl.Color（protected・不変）— 円の塗りの色（作るときに渡す）
+#     get_quantity() -> float / get_pos() -> Position — quantity / pos を返す
+#     get_radius() -> float — 今の quantity での円の半径 [pixel]
+#     get_screen_center(screen_width, screen_height) -> rl.Vector2 — 窓の中での円の中心 [pixel]
+#     contains_screen_point(point, screen_width, screen_height) -> bool — 窓の中の点が円に重なるか
+#     draw(screen_width, screen_height) -> None — 円と、中心に名前と量を描く
+#     draw_highlight_mark(screen_width, screen_height) -> None — クリックされた印を円の上に描く
+# 例: mut h2 = Solute(name = "H2", pos = Position(0.5, 0.5), quantity = 0.1, color = rl.Color(0, 121, 241, 255), is_const = True)
+#     h2.get_radius()   # 50.0（の近く）
 trait Species:
     public:
     let name: str
@@ -23,10 +140,64 @@ trait Species:
 
     fn get_pos(let self)->Position:
         return self.pos
-    
+
+    # get_radius — 今の quantity で描く円の半径を返す
+    #   戻り値: radius_for_quantity(quantity) [pixel]（quantity が NaN・正の無限大なら ValueError）
+    # 例: Adsorbate(name = "H_ads", quantity = 0.01, pos = Position(0.5, 0.5), color = rl.Color(230, 41, 55, 255)).get_radius()   # 25.0
+    fn get_radius(let self) -> float:
+        return radius_for_quantity(self.quantity)
+
+    # get_screen_center — 窓の中での円の中心の座標を返す
+    #   screen_width, screen_height: 窓の幅・高さ [pixel]
+    #   戻り値: pos を窓の大きさで換算した座標 [pixel]（左上が (0, 0)）
+    # 例: species.get_screen_center(800, 600)   # pos が Position(0.5, 0.5) なら rl.Vector2(400.0, 300.0)
+    fn get_screen_center(let self, let screen_width: int, let screen_height: int) -> rl.Vector2:
+        return self.pos.to_screen(screen_width, screen_height)
+
+    # contains_screen_point — 窓の中の点（マウスでクリックした位置など）が円に重なるかを返す
+    #   point: 確かめる点 [pixel]（rl.get_mouse_position() の値）
+    #   screen_width, screen_height: 窓の幅・高さ [pixel]
+    #   戻り値: 円の中心からの距離が半径以下なら True（縁の上も True）
+    # 例: species.contains_screen_point(rl.Vector2(400.0, 300.0), 800, 600)   # 中心なら True
+    fn contains_screen_point(let self, let point: rl.Vector2, let screen_width: int, let screen_height: int) -> bool:
+        let center = self.get_screen_center(screen_width, screen_height)
+        let offset_x = point.x - center.x
+        let offset_y = point.y - center.y
+        let radius = self.get_radius()
+        return offset_x * offset_x + offset_y * offset_y <= radius * radius
+
+    # draw — color で塗った円を描き、中心に名前と量の 2 行を描く（begin_drawing と end_drawing の間で呼ぶ）
+    #   screen_width, screen_height: 窓の幅・高さ [pixel]
+    #   量は QUANTITY_FORMAT の書式。円が小さいと文字は円からはみ出す。文字の色は行ごとに、円に収まれば塗りの明るさ、
+    #   はみ出せば窓の背景（CANVAS_BACKGROUND_COLOR）の明るさで決める（label_color_for_line）。
+    # 例: species.draw(rl.get_screen_width(), rl.get_screen_height())
+    fn draw(let self, let screen_width: int, let screen_height: int) -> None:
+        let center = self.get_screen_center(screen_width, screen_height)
+        let radius = self.get_radius()
+        rl.draw_filled_circle(center.x, center.y, radius, self.color)
+        let quantity_text = format(self.quantity, QUANTITY_FORMAT)
+        let label_height = NAME_FONT_SIZE + LABEL_LINE_GAP + QUANTITY_FONT_SIZE
+        let name_top = int(round(center.y)) - label_height // 2
+        let quantity_top = name_top + NAME_FONT_SIZE + LABEL_LINE_GAP
+        let name_color = label_color_for_line(self.name, NAME_FONT_SIZE, radius, self.color)
+        let quantity_color = label_color_for_line(quantity_text, QUANTITY_FONT_SIZE, radius, self.color)
+        draw_centered_text(self.name, center.x, name_top, NAME_FONT_SIZE, name_color)
+        draw_centered_text(quantity_text, center.x, quantity_top, QUANTITY_FONT_SIZE, quantity_color)
+
+    # draw_highlight_mark — クリックされた印（HIGHLIGHT_MARK_TEXT）を円の上に描く。窓の上にはみ出すなら円の下に描く
+    #   （begin_drawing と end_drawing の間、円を描いた後に呼ぶ）
+    #   screen_width, screen_height: 窓の幅・高さ [pixel]
+    #   ⚠ 仮の印。後で別の強調表示に置き換える
+    # 例: species.draw_highlight_mark(rl.get_screen_width(), rl.get_screen_height())
+    fn draw_highlight_mark(let self, let screen_width: int, let screen_height: int) -> None:
+        let center = self.get_screen_center(screen_width, screen_height)
+        let mark_top = highlight_mark_top(center.y, self.get_radius())
+        draw_centered_text(HIGHLIGHT_MARK_TEXT, center.x, mark_top, HIGHLIGHT_MARK_FONT_SIZE, HIGHLIGHT_MARK_COLOR)
+
     protected:
-    mut quantity: float    
+    mut quantity: float
     mut pos: Position
+    let color: rl.Color
 
 class Adsorbate(Species):
     pass
@@ -70,3 +241,33 @@ class Reaction:
 
         self.is_reversible = is_reversible
         return self
+
+
+# ---- 化学種の並びを描く・クリックされた化学種を探す ----
+
+# find_species_at — 窓の中の点に重なる化学種のうち、最も手前のものの番号を返す
+#   species_list: 描く順に並べた化学種（後ろほど手前に描かれる。draw_species_list に渡すものと同じ並び）
+#   point: 確かめる点 [pixel]（rl.get_mouse_position() の値）
+#   screen_width, screen_height: 窓の幅・高さ [pixel]
+#   戻り値: 重なる化学種のうち最も後ろの番号。どれにも重ならなければ None
+# 例: let clicked_index = find_species_at([vacancy, H_ads], rl.Vector2(400.0, 300.0), 800, 600)
+fn find_species_at(let species_list: list[Species], let point: rl.Vector2, let screen_width: int, let screen_height: int) -> Option[int]:
+    mut index = len(species_list) - 1
+    while index >= 0:
+        if species_list[index].contains_screen_point(point, screen_width, screen_height):
+            return index
+        index -= 1
+    return None
+
+# draw_species_list — 化学種を並びの順に円で描き（後ろほど手前）、highlighted_index の化学種にクリックされた印を描く
+#   （begin_drawing と end_drawing の間で呼ぶ）
+#   species_list: 描く順に並べた化学種
+#   highlighted_index: 印を描く化学種の番号（find_species_at の戻り値）。None なら印を描かない。範囲外なら IndexError
+#   screen_width, screen_height: 窓の幅・高さ [pixel]
+#   印はすべての円の後に描くので、後ろの円に隠れない。
+# 例: draw_species_list([vacancy, H_ads], 1, rl.get_screen_width(), rl.get_screen_height())
+fn draw_species_list(let species_list: list[Species], let highlighted_index: Option[int], let screen_width: int, let screen_height: int) -> None:
+    for species in species_list:
+        species.draw(screen_width, screen_height)
+    if highlighted_index is not None:
+        species_list[highlighted_index].draw_highlight_mark(screen_width, screen_height)

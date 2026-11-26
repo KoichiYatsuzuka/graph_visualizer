@@ -1,39 +1,51 @@
 import environment as env
-import chemical_graphs as cg
+# ⚠ rl は chemical_graphs より先に import する。raylib_bridge を import するモジュール（chemical_graphs）を先に import すると、
+#   このファイルで構造体を返す関数（rl.get_mouse_position など）を呼んだところで NameError: 'Vector2' is not defined になる
+#   （Arrow 0.7.2・2026-11-26 実測）
 import[cpp-dll] raylib_bridge.raylib_bridge as rl
 import raylib_bridge.raylib_consts as rlc
+import chemical_graphs as cg
 import slider_panel as sp
 
+# 化学種。pos は窓の大きさに対する割合（(0, 0) が左上、(1, 1) が右下）、color は円の塗りの色。
+# 円の半径は quantity で決まる（1 で 100 px、1/10 ごとに半分、下限 10 px）
 mut vacancy = cg.Adsorbate(
     name = "vacancy",
-    pos = cg.Position(0.1, 0.1),
-    quantity = 0.0
+    pos = cg.Position(0.1, 0.85),
+    quantity = 0.0,
+    color = rl.Color(130, 130, 130, 255)
 )
 
 
 mut H_ads = cg.Adsorbate(
     name = "H_ads",
-    pos = cg.Position(0.9, 0.9),
-    quantity = 1.0
+    pos = cg.Position(0.35, 0.78),
+    quantity = 1.0,
+    color = rl.Color(230, 41, 55, 255)
 )
 
 mut H2_gas = cg.Solute(
     name = "H2",
-    pos = cg.Position(0.9, 0.9),
+    pos = cg.Position(0.82, 0.25),
     quantity = 1.0,
-    is_const = True    
+    color = rl.Color(0, 121, 241, 255),
+    is_const = True
 )
 
 mut proton = cg.Solute(
     name = "H+",
-    pos = cg.Position(0.9, 0.9),
+    pos = cg.Position(0.82, 0.72),
     quantity = 1.0,
+    color = rl.Color(255, 161, 0, 255),
     is_const = True
 )
 
 # 矢印の形（スライダーの窓 controls から書き換える）
 mut arrow_curvature = 0.005     # 矢印の曲率 [1/pixel]（0 で直線・正なら進む向きに見て左へ曲がる）
 mut arrow_thickness = 6.0       # 矢印の軸の太さ [pixel]
+
+# クリックで選ばれた化学種の番号（species_in_draw_order() の並びでの位置）。None なら何も選ばれていない
+mut selected_species_index: Option[int] = None
 
 # set_arrow_curvature — 曲率のスライダーが動いたときに controls.apply_changes() から呼ばれ、arrow_curvature を書き換える
 #   value: スライダーの新しい値 [1/pixel]
@@ -48,13 +60,22 @@ fn set_arrow_thickness(let value: float) -> None:
     arrow_thickness = value
 
 
-# draw_species_label — 化学種の名前と量を 1 行の文字で描く（begin_drawing と end_drawing の間で呼ぶ）
-#   species: 描く化学種（Adsorbate / Solute）
-#   row:     上から何行目に描くか（0 始まり）
-# 例: draw_species_label(vacancy, 0)
-fn draw_species_label(let species: cg.Species, let row: int) -> None:
-    let label = species.name + ": " + str(species.get_quantity())
-    rl.draw_text(label.encode("utf-8"), 20, 60 + 30 * row, 20, rl.Color(40, 40, 40, 255))
+# species_in_draw_order — 描く順（後ろほど手前）に並べた化学種を返す。クリックの判定と描画に同じ並びを使う
+#   戻り値: [vacancy, H_ads, H2_gas, proton] の今の値の写し（毎フレーム呼ぶので、大域変数の quantity などの変更は次のフレームに反映される）
+# 例: let drawn_species = species_in_draw_order()
+fn species_in_draw_order() -> list[cg.Species]:
+    let drawn_species: list[cg.Species] = [vacancy, H_ads, H2_gas, proton]
+    return drawn_species
+
+# update_selection — 左ボタンが押されたフレームなら、クリックされた化学種の番号を selected_species_index に入れる
+#   （重なった円では最も手前のもの。どれにも重ならなければ None にして選択を外す）
+#   drawn_species: species_in_draw_order() の戻り値（このフレームで描く並び）
+#   screen_width, screen_height: 窓の幅・高さ [pixel]
+# 例: update_selection(species_in_draw_order(), rl.get_screen_width(), rl.get_screen_height())
+fn update_selection(let drawn_species: list[cg.Species], let screen_width: int, let screen_height: int) -> None:
+    if rl.is_mouse_button_pressed(rlc.MOUSE_BUTTON_LEFT):
+        let mouse = rl.get_mouse_position() mustbe rl.Vector2
+        selected_species_index = cg.find_species_at(drawn_species, mouse, screen_width, screen_height)
 
 
 rl.set_config_flags(rlc.FLAG_MSAA_4X_HINT)
@@ -69,15 +90,14 @@ mut running = True
 
 while running:
     controls.apply_changes()        # 前のフレームから動いたスライダーの分だけ set_arrow_* が呼ばれる
+    let screen_width = rl.get_screen_width()
+    let screen_height = rl.get_screen_height()
+    let drawn_species = species_in_draw_order()
+    update_selection(drawn_species, screen_width, screen_height)
     rl.begin_drawing()
-    rl.clear_background(rl.Color(245, 245, 245, 255))
+    rl.clear_background(cg.CANVAS_BACKGROUND_COLOR)
     rl.draw_text("graph_visualizer".encode("utf-8"), 20, 20, 24, rl.Color(40, 40, 40, 255))
-    draw_species_label(vacancy, 0)
-    draw_species_label(H_ads, 1)
-    draw_species_label(H2_gas, 2)
-    draw_species_label(proton, 3)
-    rl.draw_filled_circle(100.0, 120.0, 30.0, rl.Color(200, 20, 20, 255))
-    rl.draw_filled_circle(300.0, 320.0, 30.0, rl.Color(20, 20, 200, 255))
+    cg.draw_species_list(drawn_species, selected_species_index, screen_width, screen_height)
     #rl.draw_curved_arrow(180.0, 120.0, 380.0, 320.0, 6.0, rl.Color(200, 20, 20, 255), rl.Color(20, 20, 200, 255), 0.005)
     rl.draw_curved_arrow_flowing(180.0, 120.0, 380.0, 320.0, arrow_thickness,
         rl.Color(255, 200, 200, 255),   # start_color：始点（淡い色）
