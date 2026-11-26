@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    TimeSeriesPlotBridge — Arrow の import[cs-dll] から使う、時系列を ScottPlot で描く WinForms の窓。
+    build.ps1 が 2 回ビルドする（slider_panel と同じ手順）:
+      1 回目: dotnet build で ArrowGenerated=false（ArrowExports.g.cs を外したマネージド DLL）
+              → arrow の gen-cs-exports がそのメタデータから ArrowExports.g.cs（Arrow が呼ぶ export）を作る
+      2 回目: dotnet publish（NativeAOT。生成した export を含む）→ TimeSeriesPlotBridge_native.dll
+  -->
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <!-- windows10.0.19041 まで書く: ScottPlot.WinForms が使う SkiaSharp.Views.WindowsForms 3.119 は .NET 用のアセンブリが
+         net8.0-windows10.0.19041 にしか無く、net*-windows（= windows7.0）では .NET Framework 用が選ばれてしまう（NU1701）。
+         build.ps1 の $TargetFramework も同じにする -->
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>enable</Nullable>
+    <!-- 生成した export は using を自分で書く。WinForms の暗黙の using（System.Drawing など）と名前がぶつからないよう切る -->
+    <ImplicitUsings>disable</ImplicitUsings>
+    <PublishAot>true</PublishAot>
+    <!-- InvariantGlobalization は付けない: WinForms がアセンブリ名のカルチャ（zh-Hans など）を読むと CultureNotFoundException で落ちる -->
+    <AssemblyName>TimeSeriesPlotBridge</AssemblyName>
+    <RootNamespace>TimeSeriesPlotBridge</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="ScottPlot.WinForms" Version="5.1.59" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(ArrowGenerated)' == 'false'">
+    <Compile Remove="ArrowExports.g.cs" />
+  </ItemGroup>
+  <!-- 生成した ArrowExports.g.cs が参照する ArrowInterop.ArPtrProtocol（Arrow の配布物に無い）。slider_panel の csproj を参照 -->
+  <ItemGroup Condition="'$(ArPtrProtocolSource)' != ''">
+    <Compile Include="$(ArPtrProtocolSource)" Link="ArPtrProtocol.cs" />
+  </ItemGroup>
+</Project>

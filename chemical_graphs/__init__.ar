@@ -26,6 +26,23 @@ const MAXIMUM_ARROW_THICKNESS = 20.0        # 矢印の最大の太さ [pixel]
 const REACTION_ARROW_BEND = 0.5             # 矢印の曲がり具合 = 曲率 × 弦の長さ（0.5 で弧の膨らみは弦の長さの約 1/16。長さによらず同じ形）
 const REACTION_CENTER_RADIUS = 6.0          # 反応の中心に描く点の半径の最小 [pixel]（矢印の太さの半分より小さくはしない）
 
+# ---- 化学種と反応の中心のばねの動き（advance_spring_layout）----
+# 反応は、中心と各化学種の矢印の端（円の縁）の距離を REACTION_ARROW_REST_LENGTH に保とうとするばね。
+# 化学種どうしは、距離の -2 乗と、近づくと急に強くなる -6 乗の項の和の力で反発する（強さは大きさによらず一定）。
+# 化学種と反応の中心は質量点（質量は半径に比例）で、1 フレームに 1 回、力 → 速度 → 位置 の順に進める（半陰的オイラー法）。
+const REACTION_ARROW_REST_LENGTH = 100.0    # ばねの自然長 = 反応の中心から矢印の端（化学種の円の縁）までの距離 [pixel]
+const SPRING_CONSTANT = 10.0                # ばね定数（1 pixel 伸びたときの力。質量の単位は量 1 の化学種）
+const DAMPING_RATE = 3.0                    # 速さに比例する減衰の割合 [1/s]（無いと振動が止まらない）
+const MAX_SPRING_TIME_STEP = 1.0 / 60.0     # 1 回に進める時間の上限 [s]。最も軽い質量（半径 10 px・0.1）に
+                                            # ばね 4 本がつながっても ω Δt ≈ 0.3 < 2 で発散しない。フレームが遅れると動きが遅くなる
+# 化学種どうしの反発の大きさ = min(REPULSION_CONSTANT / d² + CLOSE_REPULSION_CONSTANT / d⁶, MAX_REPULSION_FORCE)（d は中心間の距離）
+const REPULSION_CONSTANT = 5.0e7            # 距離の -2 乗の項の強さ（距離 200 px で 1250 = ばねが 125 px 伸びた力。2e7 から強めた）
+const CLOSE_REPULSION_CONSTANT = 2.5e16     # 距離の -6 乗の項の強さ（距離 150 px で -2 乗の項と同じ大きさ。それより近いと急に強くなる）
+const MAX_REPULSION_FORCE = 1.0e4           # 1 組の反発の上限（ばねが 1000 px 伸びた力。-6 乗の項は近いと急に硬くなり、最も軽い円
+                                            # （質量 0.1）は 1 フレーム 1 回の計算で発散するので、約 117 px より近いところでは頭打ちにする）
+const REPULSION_MIN_DISTANCE = 20.0         # 反発の距離の下限 [pixel]（中心がほぼ重なっても計算が壊れないように）
+const REACTION_CENTER_QUANTITY = 0.5        # 反応の中心の質量は、この量の化学種と同じ
+
 let REACTION_ARROW_START_COLOR = rl.Color(255, 200, 200, 255)   # 矢印のグラデーションの色（淡い → 鮮やか → 濃い → 淡い が流れる）
 let REACTION_ARROW_MIDDLE_COLOR = rl.Color(230, 41, 55, 255)
 let REACTION_ARROW_END_COLOR = rl.Color(90, 0, 20, 255)         # 矢じりの色
@@ -54,6 +71,23 @@ fn radius_for_quantity(let quantity: float) -> float:
     if scaled_radius < MINIMUM_RADIUS:
         return MINIMUM_RADIUS
     return scaled_radius
+
+# mass_for_radius — 円の半径から質量を決める（半径をそのまま質量とみなす。量 1 = 半径 FULL_QUANTITY_RADIUS の化学種が質量 1）
+#   radius: 円の半径 [pixel]
+#   戻り値: radius / FULL_QUANTITY_RADIUS
+# 例: mass_for_radius(50.0)   # 0.5
+fn mass_for_radius(let radius: float) -> float:
+    return radius / FULL_QUANTITY_RADIUS
+
+# next_velocity — 力と減衰を受けた、time_step 後の速度の 1 成分を返す（化学種と反応の中心の動きで共通）
+#   velocity: 今の速度 [pixel/s]
+#   force: 受ける力（ばねの力の和）
+#   mass: 質量（mass_for_radius の単位）
+#   time_step: 進める時間 [s]
+#   戻り値: velocity + (force / mass - DAMPING_RATE × velocity) × time_step
+# 例: next_velocity(0.0, 10.0, 1.0, 0.1)   # 1.0
+fn next_velocity(let velocity: float, let force: float, let mass: float, let time_step: float) -> float:
+    return velocity + (force / mass - DAMPING_RATE * velocity) * time_step
 
 # label_color_on — 塗りの色の上で読みやすい文字の色を返す（明るい塗りには濃い灰色、暗い塗りには白）
 #   fill_color: 文字の下の塗りの色
@@ -111,6 +145,7 @@ fn highlight_mark_top(let center_y: float, let radius: float) -> int:
 #     x: float（private）— 横の位置。窓の幅に対する割合
 #     y: float（private）— 縦の位置。窓の高さに対する割合（下向きが正）
 #     to_screen(screen_width, screen_height) -> rl.Vector2 — 窓の中のピクセルの座標に換算する
+#     moved_by_pixels(offset_x, offset_y, screen_width, screen_height) -> Position — ピクセルの移動量だけずらした位置
 #     __cast__[rl.Position_CPP]() -> rl.Position_CPP — C++ 側の座標クラスへ写す
 # 例: let center = Position(0.5, 0.25).to_screen(800, 600)   # rl.Vector2(400.0, 150.0)
 class Position:
@@ -125,6 +160,14 @@ class Position:
     # 例: Position(0.1, 0.9).to_screen(800, 600)   # rl.Vector2(80.0, 540.0)
     fn to_screen(let self, let screen_width: int, let screen_height: int) -> rl.Vector2:
         return rl.Vector2(self.x * screen_width, self.y * screen_height)
+
+    # moved_by_pixels — ピクセルで表した移動量だけずらした位置を返す（自分は変えない）
+    #   offset_x, offset_y: 移動量 [pixel]
+    #   screen_width, screen_height: 窓の幅・高さ [pixel]
+    #   戻り値: Position(x + offset_x / screen_width, y + offset_y / screen_height)
+    # 例: Position(0.5, 0.5).moved_by_pixels(80.0, -60.0, 800, 600)   # Position(0.6, 0.4)
+    fn moved_by_pixels(let self, let offset_x: float, let offset_y: float, let screen_width: int, let screen_height: int) -> Position:
+        return Position(self.x + offset_x / screen_width, self.y + offset_y / screen_height)
 
     # __cast__[rl.Position_CPP] — C++ 側の座標クラス rl.Position_CPP へ変換する（`p => rl.Position_CPP` で呼ぶ）
     #   戻り値: x, y をそのまま写した rl.Position_CPP（float32 に丸められる。ピクセルへの換算はしない）
@@ -147,6 +190,10 @@ class Position:
 #     draw_highlight_mark(screen_width, screen_height) -> None — クリックされた印を円の上に描く
 #     is_quantity_fixed() -> bool — 量が反応で変わらないか（既定 False。Solute は is_const）
 #     change_quantity(amount) -> None — 量を増減させる（量が一定の化学種では何もしない）
+#     velocity_x, velocity_y: float（protected）— 速度 [pixel/s]（作ったときは 0。advance_spring_layout が更新する）
+#     get_mass() -> float — 質量点としての質量（半径に比例。mass_for_radius）
+#     get_velocity() -> rl.Vector2 — 速度
+#     move_by_force(force_x, force_y, time_step, screen_width, screen_height) -> None — 力で速度と位置を進める
 # 例: mut h2 = Solute(name = "H2", pos = Position(0.5, 0.5), quantity = 0.1, color = rl.Color(0, 121, 241, 255), is_const = True)
 #     h2.get_radius()   # 50.0（の近く）
 trait Species:
@@ -226,17 +273,68 @@ trait Species:
         if not self.is_quantity_fixed():
             self.quantity += amount
 
+    # get_mass — 質量点としての質量を返す（今の半径で決まる。mass_for_radius）
+    #   戻り値: mass_for_radius(get_radius())
+    # 例: Adsorbate(name = "A", pos = Position(0.5, 0.5), quantity = 1.0, color = rl.Color(0, 0, 0, 255)).get_mass()   # 1.0
+    fn get_mass(let self) -> float:
+        return mass_for_radius(self.get_radius())
+
+    # get_velocity — 速度を返す
+    #   戻り値: rl.Vector2(velocity_x, velocity_y) [pixel/s]（作ったときは 0）
+    # 例: species.get_velocity().x
+    fn get_velocity(let self) -> rl.Vector2:
+        return rl.Vector2(self.velocity_x, self.velocity_y)
+
+    # move_by_force — 力を受けて速度と位置を time_step だけ進める（速度を先に更新し、新しい速度で動く）。⚠ self を書き換える
+    #   force_x, force_y: 受ける力（ばねの力の和）
+    #   time_step: 進める時間 [s]
+    #   screen_width, screen_height: 窓の幅・高さ [pixel]（位置は窓に対する割合で持つので換算に使う）
+    # 例: species_list[0].move_by_force(25.0, 0.0, 1.0 / 60.0, 1100, 700)
+    fn move_by_force(mut self, let force_x: float, let force_y: float, let time_step: float, let screen_width: int, let screen_height: int) -> None:
+        let mass = self.get_mass()
+        self.velocity_x = next_velocity(self.velocity_x, force_x, mass, time_step)
+        self.velocity_y = next_velocity(self.velocity_y, force_y, mass, time_step)
+        self.pos = self.pos.moved_by_pixels(self.velocity_x * time_step, self.velocity_y * time_step, screen_width, screen_height)
+
     protected:
     mut quantity: float
     mut pos: Position
     let color: rl.Color
+    mut velocity_x: float
+    mut velocity_y: float
 
+# Adsorbate — 吸着種（量は被覆率。総和は kinetics.ADSORBATE_TOTAL に保たれる）。メンバーは Species と同じ
+# 例: mut H_ads = Adsorbate(name = "H_ads", pos = Position(0.5, 0.2), quantity = 1.0, color = rl.Color(230, 41, 55, 255))
 class Adsorbate(Species):
-    pass
+    public:
+    # __init__ — 吸着種を作る（速度は 0 から始める）
+    #   name: 名前、pos: 位置（窓に対する割合）、quantity: 量、color: 円の色
+    fn __init__(mut self, let name: str, let pos: Position, let quantity: float, let color: rl.Color) -> Self:
+        self.name = name
+        self.pos = pos
+        self.quantity = quantity
+        self.color = color
+        self.velocity_x = 0.0
+        self.velocity_y = 0.0
+        return self
 
+# Solute — 溶存種。is_const（public・不変・bool）が True なら外から無限に供給・拡散され、量は一定。ほかのメンバーは Species と同じ
+# 例: mut proton = Solute(name = "H+", pos = Position(0.5, 0.5), quantity = 1.0, color = rl.Color(255, 161, 0, 255), is_const = True)
 class Solute(Species):
     public:
     let is_const: bool
+
+    # __init__ — 溶存種を作る（速度は 0 から始める）
+    #   name: 名前、pos: 位置（窓に対する割合）、quantity: 量、color: 円の色、is_const: 量を一定に保つか
+    fn __init__(mut self, let name: str, let pos: Position, let quantity: float, let color: rl.Color, let is_const: bool) -> Self:
+        self.name = name
+        self.pos = pos
+        self.quantity = quantity
+        self.color = color
+        self.is_const = is_const
+        self.velocity_x = 0.0
+        self.velocity_y = 0.0
+        return self
 
     # is_quantity_fixed — is_const が True なら、外から無限に供給・拡散されて量は一定（反応で変わらない）
     #   戻り値: is_const
@@ -344,9 +442,17 @@ fn draw_reaction_segment(let start: rl.Vector2, let end: rl.Vector2, let thickne
 #   戻り値: 最初に見つかった化学種。無ければ ValueError
 # 例: find_species_by_name(species_pool, "H_ads").get_radius()
 fn find_species_by_name(let species_list: list[Species], let species_name: str) -> Species:
-    for species in species_list:
-        if species.name == species_name:
-            return species
+    return species_list[species_index_by_name(species_list, species_name)]
+
+# species_index_by_name — 化学種の並びから名前で化学種の番号を探す
+#   species_list: 化学種の並び
+#   species_name: 名前
+#   戻り値: 最初に見つかった番号。無ければ ValueError
+# 例: species_index_by_name(species_pool, "H_ads")   # 1
+fn species_index_by_name(let species_list: list[Species], let species_name: str) -> int:
+    for species_index in range(len(species_list)):
+        if species_list[species_index].name == species_name:
+            return species_index
     raise ValueError("species '" + species_name + "' is not in the species list")
 
 # Reaction — 化学種（node_A の側）と化学種（node_B の側）をつなぐ反応。node_A → node_B を正反応とする
@@ -356,7 +462,10 @@ fn find_species_by_name(let species_list: list[Species], let species_name: str) 
 #     fw_rate_coefficient: Fn_RateCoefficient（public・不変）— 正反応の速度定数を返す関数（kinetics で作る）
 #     bw_rate_coefficient: Fn_RateCoefficient（public・不変）— 逆反応の速度定数を返す関数
 #     is_reversible: bool（public・不変）— False なら逆反応を起こさない
-#     pos: Position（private・不変）— 反応の中心の位置（窓の大きさに対する割合）。基質と生成物を結ぶ矢印がここを通る
+#     pos: Position（private）— 反応の中心の位置（窓の大きさに対する割合）。基質と生成物を結ぶ矢印がここを通る。ばねで動く
+#     velocity_x, velocity_y: float（private）— 反応の中心の速度 [pixel/s]（作ったときは 0）
+#     get_mass() / get_screen_center(screen_width, screen_height) / get_velocity() / move_by_force(...) — 質量点としての操作
+#       （質量は量 REACTION_CENTER_QUANTITY の化学種と同じ）
 #     forward_rate_coefficient(potential) -> float / backward_rate_coefficient(potential) -> float — その電位での速度定数
 #     net_stoichiometry(species_name) -> int — 正反応が 1 回進んだときの、その化学種の数の変化（右辺の係数 - 左辺の係数）
 #     species_names() -> list[str] — 反応に出てくる化学種の名前（重複なし・左辺から順）
@@ -399,6 +508,8 @@ class Reaction:
         self.bw_rate_coefficient = bw_rate_coefficient
 
         self.pos = pos
+        self.velocity_x = 0.0
+        self.velocity_y = 0.0
         self.is_reversible = is_reversible
         return self
 
@@ -422,7 +533,40 @@ class Reaction:
         rl.draw_filled_circle(center.x, center.y, max(REACTION_CENTER_RADIUS, thickness / 2.0), REACTION_CENTER_COLOR)
 
     private:
-    let pos: Position
+    mut pos: Position
+    mut velocity_x: float
+    mut velocity_y: float
+
+    public:
+    # get_mass — 反応の中心の質量を返す（量 REACTION_CENTER_QUANTITY の化学種と同じ）
+    #   戻り値: mass_for_radius(radius_for_quantity(REACTION_CENTER_QUANTITY))（約 0.66）
+    # 例: volmer.get_mass()
+    fn get_mass(let self) -> float:
+        return mass_for_radius(radius_for_quantity(REACTION_CENTER_QUANTITY))
+
+    # get_screen_center — 窓の中での反応の中心の座標を返す
+    #   screen_width, screen_height: 窓の幅・高さ [pixel]
+    #   戻り値: pos を窓の大きさで換算した座標 [pixel]
+    # 例: volmer.get_screen_center(1100, 700)
+    fn get_screen_center(let self, let screen_width: int, let screen_height: int) -> rl.Vector2:
+        return self.pos.to_screen(screen_width, screen_height)
+
+    # get_velocity — 反応の中心の速度を返す
+    #   戻り値: rl.Vector2(velocity_x, velocity_y) [pixel/s]（作ったときは 0）
+    # 例: volmer.get_velocity().x
+    fn get_velocity(let self) -> rl.Vector2:
+        return rl.Vector2(self.velocity_x, self.velocity_y)
+
+    # move_by_force — 力を受けて反応の中心の速度と位置を time_step だけ進める（Species.move_by_force と同じ計算）。⚠ self を書き換える
+    #   force_x, force_y: 受ける力（ばねの反作用の和）
+    #   time_step: 進める時間 [s]
+    #   screen_width, screen_height: 窓の幅・高さ [pixel]
+    # 例: reactions[0].move_by_force(-25.0, 0.0, 1.0 / 60.0, 1100, 700)
+    fn move_by_force(mut self, let force_x: float, let force_y: float, let time_step: float, let screen_width: int, let screen_height: int) -> None:
+        let mass = self.get_mass()
+        self.velocity_x = next_velocity(self.velocity_x, force_x, mass, time_step)
+        self.velocity_y = next_velocity(self.velocity_y, force_y, mass, time_step)
+        self.pos = self.pos.moved_by_pixels(self.velocity_x * time_step, self.velocity_y * time_step, screen_width, screen_height)
 
     # draw_through_center — sources の各化学種の円の縁 → 反応の中心（矢じりなし）、中心 → targets の各化学種の円の縁（矢じりあり）を描く
     #   species_list: 化学種の並び（今の量・位置を名前で読む）
@@ -518,3 +662,84 @@ fn draw_species_list(let species_list: list[Species], let highlighted_index: Opt
         species.draw(screen_width, screen_height)
     if highlighted_index is not None:
         species_list[highlighted_index].draw_highlight_mark(screen_width, screen_height)
+
+# ---- ばねで化学種と反応の中心を動かす ----
+
+# spring_force_on_species — 反応のばね 1 本が化学種に及ぼす力を返す（反応の中心にはこの逆向きの力がかかる）
+#   reaction_center: 反応の中心 [pixel]
+#   species_center: 化学種の円の中心 [pixel]
+#   species_radius: 化学種の円の半径 [pixel]
+#   戻り値: (力の x, 力の y)。矢印の長さ（中心間の距離 - 半径）が REACTION_ARROW_REST_LENGTH より長ければ中心へ引き、
+#           短ければ押し返す: -SPRING_CONSTANT × (長さ - 自然長) × （反応の中心から化学種への単位ベクトル）。
+#           2 つの中心が重なっていれば (0.0, 0.0)（向きが決まらない）
+# 例: spring_force_on_species(rl.Vector2(400.0, 300.0), rl.Vector2(160.0, 300.0), 12.5)   # (1275.0, 0.0)（127.5 px 伸びて右へ引く）
+fn spring_force_on_species(let reaction_center: rl.Vector2, let species_center: rl.Vector2, let species_radius: float) -> tuple[float, float]:
+    let distance = distance_between(reaction_center, species_center)
+    if distance == 0.0:
+        return (0.0, 0.0)
+    let extension = distance - species_radius - REACTION_ARROW_REST_LENGTH
+    let force_per_distance = -SPRING_CONSTANT * extension / distance
+    return (force_per_distance * (species_center.x - reaction_center.x), force_per_distance * (species_center.y - reaction_center.y))
+
+# repulsion_magnitude — 中心間の距離 distance の 2 つの化学種が押し合う力の大きさを返す
+#   distance: 中心間の距離 [pixel]（REPULSION_MIN_DISTANCE より近くてもその距離として扱う）
+#   戻り値: min(REPULSION_CONSTANT / d² + CLOSE_REPULSION_CONSTANT / d⁶, MAX_REPULSION_FORCE)
+#           遠いと -2 乗の項、150 px より近いと -6 乗の項が主になり、約 117 px より近いと MAX_REPULSION_FORCE で頭打ち
+#   強さは化学種の大きさ・質量によらず一定
+# 例: repulsion_magnitude(400.0)   # 312.5 + 6.1 = 318.6
+fn repulsion_magnitude(let distance: float) -> float:
+    let effective_distance = max(distance, REPULSION_MIN_DISTANCE)
+    let squared_distance = effective_distance * effective_distance
+    let magnitude = REPULSION_CONSTANT / squared_distance + CLOSE_REPULSION_CONSTANT / (squared_distance * squared_distance * squared_distance)
+    return min(magnitude, MAX_REPULSION_FORCE)
+
+# repulsion_force_on_species — 化学種どうしの反発のうち、other から pushed が受ける力を返す（other には逆向きの力がかかる）
+#   pushed_center, other_center: 2 つの化学種の円の中心 [pixel]
+#   戻り値: (力の x, 力の y)。大きさ repulsion_magnitude(d)（d は中心間の距離）で、other から pushed へ向かう向き。
+#           2 つの中心が重なっていれば (0.0, 0.0)（向きが決まらない）
+# 例: repulsion_force_on_species(rl.Vector2(600.0, 300.0), rl.Vector2(200.0, 300.0))   # (repulsion_magnitude(400.0), 0.0)
+fn repulsion_force_on_species(let pushed_center: rl.Vector2, let other_center: rl.Vector2) -> tuple[float, float]:
+    let distance = distance_between(other_center, pushed_center)
+    if distance == 0.0:
+        return (0.0, 0.0)
+    let force_per_distance = repulsion_magnitude(distance) / distance
+    return (force_per_distance * (pushed_center.x - other_center.x), force_per_distance * (pushed_center.y - other_center.y))
+
+# advance_spring_layout — 反応のばねの力で、化学種と反応の中心の速度と位置を 1 フレーム分進める
+#   species_list: 化学種の並び（main.ar の species_pool）。⚠ 速度と位置が書き換わる
+#   reactions: 反応の並び。⚠ 中心の速度と位置が書き換わる
+#   display_seconds: 前のフレームからの画面の経過時間 [s]（MAX_SPRING_TIME_STEP で頭打ち。負なら 0）
+#   screen_width, screen_height: 窓の幅・高さ [pixel]
+#   ① 各反応の、中心と各基質・生成物の間のばねの力と、化学種どうしの反発の力を足し合わせる
+#      （どちらも作用・反作用なので運動量の和は保たれる）
+#   ② すべての化学種と反応の中心について、力 → 速度 → 位置 の順に進める（Species / Reaction.move_by_force）
+#   反応の化学種が species_list に無ければ ValueError
+# 例: advance_spring_layout(species_pool, reactions, rl.get_frame_time(), rl.get_screen_width(), rl.get_screen_height())
+fn advance_spring_layout(mut species_list: list[Species], mut reactions: list[Reaction], let display_seconds: float, let screen_width: int, let screen_height: int) -> None:
+    let time_step = min(max(display_seconds, 0.0), MAX_SPRING_TIME_STEP)
+    mut species_forces_x: list[float] = [0.0] * len(species_list)
+    mut species_forces_y: list[float] = [0.0] * len(species_list)
+    mut reaction_forces_x: list[float] = [0.0] * len(reactions)
+    mut reaction_forces_y: list[float] = [0.0] * len(reactions)
+    for reaction_index in range(len(reactions)):
+        let reaction_center = reactions[reaction_index].get_screen_center(screen_width, screen_height)
+        for entry in reactions[reaction_index].node_A + reactions[reaction_index].node_B:
+            let species_index = species_index_by_name(species_list, entry.species.name)
+            let species_center = species_list[species_index].get_screen_center(screen_width, screen_height)
+            let force = spring_force_on_species(reaction_center, species_center, species_list[species_index].get_radius())
+            species_forces_x[species_index] += force[0]
+            species_forces_y[species_index] += force[1]
+            reaction_forces_x[reaction_index] -= force[0]
+            reaction_forces_y[reaction_index] -= force[1]
+    for pushed_index in range(len(species_list)):
+        let pushed_center = species_list[pushed_index].get_screen_center(screen_width, screen_height)
+        for other_index in range(pushed_index + 1, len(species_list)):
+            let repulsion = repulsion_force_on_species(pushed_center, species_list[other_index].get_screen_center(screen_width, screen_height))
+            species_forces_x[pushed_index] += repulsion[0]
+            species_forces_y[pushed_index] += repulsion[1]
+            species_forces_x[other_index] -= repulsion[0]
+            species_forces_y[other_index] -= repulsion[1]
+    for species_index in range(len(species_list)):
+        species_list[species_index].move_by_force(species_forces_x[species_index], species_forces_y[species_index], time_step, screen_width, screen_height)
+    for reaction_index in range(len(reactions)):
+        reactions[reaction_index].move_by_force(reaction_forces_x[reaction_index], reaction_forces_y[reaction_index], time_step, screen_width, screen_height)

@@ -1,12 +1,13 @@
 # graph_visualizer のビルド要件
 
-このリポジトリは、Arrow から呼ぶ **2 つのネイティブ DLL** をビルドしてから使います。DLL と取ってきたライブラリは
+このリポジトリは、Arrow から呼ぶ **3 つのネイティブ DLL** をビルドしてから使います。DLL と取ってきたライブラリは
 `.gitignore` に入っているので、clone した直後の PC では下の手順でビルドし直します。
 
 | ビルドするもの | 中身 | 作るスクリプト | できるファイル |
 |---|---|---|---|
 | raylib_bridge | raylib 5.5 を Arrow から呼ぶ C++ の中継 DLL | `raylib_bridge/install_raylib.ps1` → `raylib_bridge/build.ps1` | `raylib_bridge/raylib_bridge.dll`（約 0.5 MB） |
 | slider_panel | スライダーの窓（C# WinForms・NativeAOT） | `slider_panel/build.ps1` | `slider_panel/SliderPanelBridge.dll`（約 26 KB）・`slider_panel/SliderPanelBridge_native.dll`（約 57 MB） |
+| time_series_plot | 時系列の窓（C# WinForms + ScottPlot 5 の FormsPlot・.NET 10 の NativeAOT） | `time_series_plot/build.ps1` | `time_series_plot/TimeSeriesPlotBridge.dll`（約 30 KB）・`TimeSeriesPlotBridge_native.dll`（約 21 MB）・`libSkiaSharp.dll`（約 11 MB）・`libHarfBuzzSharp.dll`（約 2 MB） |
 
 対応する OS は **Windows x64 だけ**です（raylib は Windows 用の配布物、窓は WinForms、DLL は win-x64 向け）。
 
@@ -97,22 +98,48 @@ powershell -ExecutionPolicy Bypass -File slider_panel/build.ps1
 - 対処の案（未実施・未検証）: .NET 10 SDK を入れ、`slider_panel/SliderPanelBridge.csproj` の `TargetFramework` と
   `slider_panel/build.ps1` の `$TargetFramework` を `net10.0-windows` にしてビルドし直し、`tests/run_tests.ps1` で確かめる。
 
+## 4. time_series_plot（C# WinForms + ScottPlot・NativeAOT）
+
+要件は slider_panel とほぼ同じ（Visual Studio の C++・Arrow・`ArPtrProtocol.cs`）で、違うのは次のもの:
+
+| もの | 要件 |
+|---|---|
+| .NET SDK | **10.0.100 以降**（確かめたのは 10.0.404。NativeAOT のパッケージは 10.0.15 が選ばれ、NU1903 は出ない） |
+| ターゲット | **`net10.0-windows10.0.19041.0`**（`windows10.0.19041` まで書く。下の注意）・`win-x64`・`PublishAot=true` |
+| NuGet のパッケージ | **ScottPlot.WinForms 5.1.59**（MIT。csproj で版を固定）と、それが引く ScottPlot・SkiaSharp 3.119.0・SkiaSharp.Views.WindowsForms・HarfBuzzSharp・OpenTK（FormsPlotGL 用。使わない）。初回の `build.ps1` が取ってくる |
+| 実行時 | `TimeSeriesPlotBridge.dll`・`TimeSeriesPlotBridge_native.dll` に加え、SkiaSharp のネイティブ DLL `libSkiaSharp.dll`・`libHarfBuzzSharp.dll` を `time_series_plot/` に置く（`build.ps1` が publish の出力から写す。`SkiaNativeLoader.cs` がこのフォルダから先に読み込む） |
+
+- **ターゲットに `windows10.0.19041` まで書く**: FormsPlot が使う SkiaSharp.Views.WindowsForms 3.119.0 は、.NET 用のアセンブリが
+  `net8.0-windows10.0.19041` にしか無く、`net*-windows`（= windows7.0）では .NET Framework 用が選ばれて NU1701 になります。
+  csproj の `TargetFramework` と `build.ps1` の `$TargetFramework` は同じにします。
+- slider_panel と同じく `InvariantGlobalization` は付けません。WM_GETOBJECT は、フォームは WndProc で、派生を作れない FormsPlot の中の
+  窓（TransparentSKControl）は `ObjectQueryBlocker`（NativeWindow で割り込む）で止めます（`TimeSeriesPlotForm.cs`）。
+- FormsPlot の標準の右クリックのメニュー（画像の保存のダイアログ・クリップボード）は COM を使うので外しています（NativeAOT で動くかは未確認）。
+- NativeAOT の DLL が slider_panel（.NET 8）と合わせて 2 つ、同じプロセスに入ります（それぞれ別の版の .NET のランタイムを持つ）。同時に開けることは
+  `tests/test_time_series_plot.ar` で確かめています。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File time_series_plot/build.ps1
+```
+
 ---
 
-## 4. 全体の手順と確認
+## 5. 全体の手順と確認
 
 ```powershell
 # リポジトリのルートで。test_lang（Arrow のソース）が ../test_lang にあること
 powershell -ExecutionPolicy Bypass -File raylib_bridge/install_raylib.ps1
 powershell -ExecutionPolicy Bypass -File raylib_bridge/build.ps1
 powershell -ExecutionPolicy Bypass -File slider_panel/build.ps1
-powershell -ExecutionPolicy Bypass -File tests/run_tests.ps1    # 自動テスト（窓は表示しない）。「2 / 2 passed」なら成功
-arrow main.ar                                                   # raylib の窓とスライダーの窓が開く
+powershell -ExecutionPolicy Bypass -File time_series_plot/build.ps1
+powershell -ExecutionPolicy Bypass -File tests/run_tests.ps1    # 自動テスト（窓は表示しない）。「7 / 7 passed」なら成功
+arrow main.ar                                                   # raylib の窓・スライダーの窓・電位の時系列の窓が開く
 ```
 
 | テスト | 確かめること |
 |---|---|
 | `tests/test_raylib_bridge.ar` | raylib_bridge のすべての関数を呼び、描いた画素を読み戻して色・位置を確かめる |
 | `tests/test_slider_panel.ar` | スライダーを動かすと `apply_changes` で Arrow の `mut` 変数が書き換わること、引数の誤り・窓を閉じた後の振る舞い |
+| `tests/test_time_series_plot.ar` | 輪のように使う時系列の書く順・一周後の上書き、窓の写しとの一致、ScottPlot で描けて PNG を保存できること、操作しなければ追従が続くこと、スライダーの窓と同時に開けること、窓を閉じた後の振る舞い |
 
 初回の `arrow` の実行では、`import[cpp-dll]` の中継 DLL を `rustc` でコンパイルするので、起動に少し時間がかかります。

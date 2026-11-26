@@ -1,0 +1,201 @@
+# time_series_plot — 固定長の時系列（輪のように使う配列）を保存し、C#（WinForms + ScottPlot の FormsPlot）の窓にリアルタイムで描く
+#
+# 使い方（main.ar のようにリポジトリのルートのファイルから）:
+#     import time_series_plot as tsp
+#
+#     mut potential_history = tsp.RingSeries(300)                 # 300 点。最初はすべて (0.0, 0.0)
+#     mut potential_plot = tsp.TimeSeriesWindow("potential history", 300, "Period", "E / V")
+#     while running:
+#         potential_history.record(elapsed_periods, potential)    # 番号を 1 つずつずらして今の値を入れる（最後の次は 0 番）
+#         potential_plot.show_newest(potential_history)           # 入れた点を窓へ送る（待たずに戻る）
+#     potential_plot.close()
+#
+# 窓は RingSeries の点を、最も古い点から最新の点まで線でつなぎ、最新の点を赤い点で強調する。軸の範囲はふだん点に合わせる（追従）。
+# 窓の図はマウスで動かせる: 左ドラッグで移動、右ドラッグ・ホイールで拡大縮小、中ドラッグで範囲を選んで拡大。
+# 動かすと追従を止め（窓のタイトルに paused と出る）、ダブルクリックか中クリックで追従に戻る。
+# 窓は C# の別スレッドで動き、約 30 回/秒 描き直すので、Arrow のループは止まらない。
+#
+# 前提: time_series_plot/build.ps1 で TimeSeriesPlotBridge.dll・TimeSeriesPlotBridge_native.dll・
+#       libSkiaSharp.dll・libHarfBuzzSharp.dll を作ってあること。
+
+import[cs-dll] .TimeSeriesPlotBridge as bridge
+
+# check_capacity — 時系列の点の数を確かめ、1 未満なら ValueError を投げる
+#   capacity: 点の数
+# 例: check_capacity(300)   # 何も起きない
+fn check_capacity(let capacity: int) -> None:
+    if capacity < 1:
+        raise ValueError("capacity must be 1 or more, got " + str(capacity))
+
+# RingSeries — 長さ capacity の配列を輪のように使う時系列（横軸の値 x と縦軸の値 y の組）
+#
+# record を呼ぶたびに書く番号を 1 つずらし（最後の番号の次は 0 番に戻る）、その番号の点を今の値で上書きする。
+# 最初はすべての点が (0.0, 0.0) で、最初の record は 0 番に書く。最新の点の次の番号が最も古い点。
+#
+# メンバー:
+#   x_values: list[float]  — 点の横軸の値（private。番号順）
+#   y_values: list[float]  — 点の縦軸の値（private。番号順）
+#   newest_index: int      — 最新の点の番号（private。最初は capacity - 1）
+#   record(x, y) -> int    — 次の番号に点を書き、その番号を返す
+#   get_capacity() -> int  — 点の数
+#   get_newest_index() -> int — 最新の点の番号
+#   x_at(index), y_at(index) -> float — 番号の点の値
+#
+# 例:
+#   mut history = RingSeries(3)
+#   history.record(0.1, 5.0)        # 0 番に書いて 0 を返す
+#   history.record(0.2, 6.0)        # 1
+#   history.record(0.3, 7.0)        # 2
+#   history.record(0.4, 8.0)        # 0（最も古い 0 番を上書き）
+class RingSeries:
+    private:
+    mut x_values: list[float]
+    mut y_values: list[float]
+    mut newest_index: int
+
+    public:
+    # __init__ — すべての点が (0.0, 0.0) の時系列を作る
+    #   capacity: 点の数（1 以上。1 未満なら ValueError）
+    # 例: mut potential_history = RingSeries(300)
+    fn __init__(mut self, let capacity: int) -> Self:
+        check_capacity(capacity)
+        self.x_values = [0.0] * capacity
+        self.y_values = [0.0] * capacity
+        self.newest_index = capacity - 1
+        return self
+
+    # record — 書く番号を 1 つずらし（最後の番号の次は 0 番）、その番号の点を (x, y) で上書きする
+    #   x: 横軸の値、y: 縦軸の値
+    #   戻り値: 書いた番号（これが最新の点の番号になる）
+    # 例: let written_index = history.record(1.25, 0.012)
+    fn record(mut self, let x: float, let y: float) -> int:
+        self.newest_index = (self.newest_index + 1) % len(self.x_values)
+        self.x_values[self.newest_index] = x
+        self.y_values[self.newest_index] = y
+        return self.newest_index
+
+    # get_capacity — 点の数
+    # 例: history.get_capacity() == 300
+    fn get_capacity(let self) -> int:
+        return len(self.x_values)
+
+    # get_newest_index — 最新の点の番号（record の前は capacity - 1）
+    # 例: let newest = history.get_newest_index()
+    fn get_newest_index(let self) -> int:
+        return self.newest_index
+
+    # x_at / y_at — 番号 index の点の横軸・縦軸の値
+    #   index: 点の番号（0 以上 capacity 未満。範囲外は IndexError）
+    # 例: let latest_potential = history.y_at(history.get_newest_index())
+    fn x_at(let self, let index: int) -> float:
+        self.check_index(index)
+        return self.x_values[index]
+
+    fn y_at(let self, let index: int) -> float:
+        self.check_index(index)
+        return self.y_values[index]
+
+    private:
+    # check_index — 番号が範囲外なら IndexError を投げる
+    fn check_index(let self, let index: int) -> None:
+        if index < 0 or index >= len(self.x_values):
+            raise IndexError("point index " + str(index) + " is out of range (capacity " + str(len(self.x_values)) + ")")
+
+# TimeSeriesWindow — RingSeries を描く C# の窓（WinForms + ScottPlot）
+#
+# 窓は点の写しを持つ（番号は RingSeries と同じ）。show_newest で RingSeries の最新の点だけを送るので、
+# 窓を作った後の record ごとに 1 回 show_newest を呼ぶ（呼び忘れた点は写しに入らない）。
+# 送るのは写しを書き換えるだけで待たずに戻り、C# の UI スレッドが約 30 回/秒 で描き直す。
+#
+# メンバー:
+#   plot: bridge.TimeSeriesPlot — C# の窓（private）
+#   show_newest(series)         — series の最新の点を写しへ送り、赤い点をそこへ動かす
+#   plotted_x(index), plotted_y(index) -> float — 窓の写しの点の値（テスト用）
+#   plotted_newest_index() -> int — 窓の写しの最新の点の番号（テスト用）
+#   render_now()                — 送った点を今すぐ描く（描き終わるまで待つ。テスト用）
+#   is_following_latest() -> bool — 軸の範囲を点に合わせ続けているか（利用者が図を動かすと False）
+#   save_png(path, width, height) — 今の図を PNG で保存する
+#   is_open() -> bool           — 窓が開いているか（利用者が閉じるボタンを押すと False）
+#   close()                     — 窓を閉じる（何度呼んでもよい）
+#
+# 例:
+#   mut potential_plot = TimeSeriesWindow("potential history", 300, "Period", "E / V")
+#   potential_plot.show_newest(potential_history)
+class TimeSeriesWindow:
+    private:
+    let plot: bridge.TimeSeriesPlot
+
+    public:
+    # __init__ — 点がすべて (0.0, 0.0) の窓を作る（窓ができるまで待って戻る）
+    #   title:    窓のタイトル
+    #   capacity: 点の数（描く RingSeries の get_capacity() と同じにする。1 未満なら ValueError）
+    #   x_label:  横軸の名前
+    #   y_label:  縦軸の名前
+    #   visible:  True なら表示する。False なら表示しない（自動テスト用。点を送る・描く・保存することはできる）
+    # 例: mut potential_plot = TimeSeriesWindow("potential history", 300, "Period", "E / V")
+    fn __init__(mut self, let title: str, let capacity: int, let x_label: str, let y_label: str, let visible: bool = True) -> Self:
+        check_capacity(capacity)
+        self.plot = bridge.TimeSeriesPlot(title, capacity, visible)
+        self.plot.SetAxisLabels(x_label, y_label)
+        return self
+
+    # show_newest — series の最新の点を窓の写しの同じ番号へ送り、赤い点をそこへ動かす（待たずに戻る）
+    #   series: 描く時系列（容量が窓と違えば ValueError）
+    #   窓が閉じていれば何もしない（利用者が窓を閉じても描画ループを止めないため）。
+    # 例: potential_plot.show_newest(potential_history)
+    fn show_newest(mut self, let series: RingSeries) -> None:
+        if series.get_capacity() != self.plot.Capacity():
+            raise ValueError("series capacity " + str(series.get_capacity()) + " differs from the window capacity " + str(self.plot.Capacity()))
+        if not self.plot.IsOpen():
+            return
+        let newest_index = series.get_newest_index()
+        self.plot.SetPoint(newest_index, series.x_at(newest_index), series.y_at(newest_index))
+
+    # plotted_x / plotted_y — 窓の写しの番号 index の点の値（テスト用。範囲外は Arrow の例外）
+    # 例: potential_plot.plotted_y(0)
+    fn plotted_x(let self, let index: int) -> float:
+        return self.plot.XAt(index)
+
+    fn plotted_y(let self, let index: int) -> float:
+        return self.plot.YAt(index)
+
+    # plotted_newest_index — 窓の写しの最新の点（赤い点）の番号（show_newest の前は capacity - 1）
+    # 例: potential_plot.plotted_newest_index() == potential_history.get_newest_index()
+    fn plotted_newest_index(let self) -> int:
+        return self.plot.NewestIndex()
+
+    # render_now — 送った点を今すぐ描く（C# の UI スレッドが描き終わるまで待つ）。窓が閉じていれば RuntimeError
+    # 例: potential_plot.render_now()
+    fn render_now(mut self) -> None:
+        self.check_open()
+        self.plot.RenderNow()
+
+    # is_following_latest — 軸の範囲を点に合わせ続けているか（利用者が図を動かすと False、ダブルクリックで True に戻る）
+    #   窓が閉じていれば RuntimeError
+    # 例: if not potential_plot.is_following_latest(): print("the plot is paused")
+    fn is_following_latest(let self) -> bool:
+        self.check_open()
+        return self.plot.IsFollowingLatest()
+
+    # save_png — 今の図を width × height ピクセルの PNG で path へ保存する（窓の大きさ・表示によらない。あれば上書き）
+    #   窓が閉じていれば RuntimeError、大きさが 1 未満なら Arrow の例外。
+    # 例: potential_plot.save_png("potential_history.png", 800, 450)
+    fn save_png(mut self, let path: str, let width: int, let height: int) -> None:
+        self.check_open()
+        self.plot.SavePng(path, width, height)
+
+    # is_open — 窓が開いているか（利用者が閉じるボタンを押した後・close の後は False）
+    # 例: if not potential_plot.is_open(): print("the plot window was closed")
+    fn is_open(let self) -> bool:
+        return self.plot.IsOpen()
+
+    # close — 窓を閉じ、窓のスレッドが終わるのを待つ（何度呼んでもよい）
+    # 例: potential_plot.close()
+    fn close(mut self) -> None:
+        self.plot.Close()
+
+    private:
+    # check_open — 窓が閉じていれば RuntimeError を投げる
+    fn check_open(let self) -> None:
+        if not self.plot.IsOpen():
+            raise RuntimeError("the time series plot window is closed")

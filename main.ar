@@ -7,14 +7,15 @@ import raylib_bridge.raylib_consts as rlc
 import chemical_graphs as cg
 import kinetics as kn
 import slider_panel as sp
+import time_series_plot as tsp
 import[py] math
 import[py] waveform     # このディレクトリの waveform.py（1 フレーム分の sin 波の電位をまとめて計算する）
 
-# 化学種の初期状態。pos は窓の大きさに対する割合（(0, 0) が左上、(1, 1) が右下）、color は円の塗りの色。
+# 化学種の初期状態。pos は窓の大きさに対する割合（(0, 0) が左上、(1, 1) が右下。初期位置で、反応のばねで動く）、color は円の塗りの色。
 # 円の半径は quantity で決まる（1 で 100 px、1/10 ごとに半分、下限 10 px）。
-# ⚠ 実行中の量は species_pool（下）が持つ。これらの変数は初期状態と、反応式で化学種を名前で指すためだけに使う
+# ⚠ 実行中の量・位置・速度は species_pool（下）が持つ。これらの変数は初期状態と、反応式で化学種を名前で指すためだけに使う
 #   （Arrow では list やフィールドに入れると写しになるので、量を 1 か所にまとめている。let にすると写しも不変になり、
-#    kn が量を書き換えられない）
+#    kn や cg.advance_spring_layout が書き換えられない）
 mut vacancy = cg.Adsorbate(
     name = "vacancy",
     pos = cg.Position(0.5, 0.85),
@@ -58,7 +59,7 @@ const ELECTRON_TRANSFER_COEFFICIENT = 0.5   # 電荷移動係数 α（両反応�
 
 # Volmer 反応: H+ + e- + * → H_ads（正反応 = 還元）
 let volmer_rate_coefficients = kn.butler_volmer_k_pair(VOLMER_CENTER_POTENTIAL, VOLMER_K0, ELECTRON_TRANSFER_COEFFICIENT)
-let volmer = cg.Reaction(
+mut volmer = cg.Reaction(
     [cg.Stoichiometry(proton, 1), cg.Stoichiometry(vacancy, 1)],
     [cg.Stoichiometry(H_ads, 1)],
     volmer_rate_coefficients[0],
@@ -68,7 +69,7 @@ let volmer = cg.Reaction(
 
 # Heyrovsky 反応: H_ads + H+ + e- → H2 + *（正反応 = 還元）
 let heyrovsky_rate_coefficients = kn.butler_volmer_k_pair(HEYROVSKY_CENTER_POTENTIAL, HEYROVSKY_K0, ELECTRON_TRANSFER_COEFFICIENT)
-let heyrovsky = cg.Reaction(
+mut heyrovsky = cg.Reaction(
     [cg.Stoichiometry(H_ads, 1), cg.Stoichiometry(proton, 1)],
     [cg.Stoichiometry(H2_gas, 1), cg.Stoichiometry(vacancy, 1)],
     heyrovsky_rate_coefficients[0],
@@ -76,7 +77,8 @@ let heyrovsky = cg.Reaction(
     cg.Position(0.7, 0.5)
 )
 
-let reactions: list[cg.Reaction] = [volmer, heyrovsky]
+# 反応の並び。中心の位置・速度は cg.advance_spring_layout が毎フレーム書き換える（mut にしておく。let だと要素が不変になる）
+mut reactions: list[cg.Reaction] = [volmer, heyrovsky]
 let reaction_network = kn.ReactionNetwork(species_pool, reactions)   # 化学種と反応を番号で引く計算用の表（species_pool と同じ並び）
 
 # ---- 電位の時間変化 ----
@@ -96,6 +98,14 @@ mut potential_amplitude = INITIAL_AMPLITUDE_MV / 1000.0 # sin 波の振幅 [V]�
 mut simulated_seconds = 0.0                            # シミュレーションの経過時間 [s]（frame_step が進める）
 mut phase_cycles = 0.0                                 # sin 波の位相 [周期]（frame_step が 周波数 × シミュレーションの時間刻み だけ進める）
 mut electrode_potential = env.Potential(0.0)           # このフレームの最後のサブステップの電位（表示用。frame_step が決める）
+mut elapsed_periods = 0.0                              # 始めからの位相 [周期]（phase_cycles と違い 1 で戻さない。frame_step が進める）
+mut electrode_potential_periods = 0.0                  # electrode_potential を計算した位相 [周期]（電位の時系列の横軸。frame_step が決める）
+
+# ---- 電位の時系列（別の窓に描く）----
+# 過去 POTENTIAL_HISTORY_FRAMES フレームの (位相 [周期], 電位 [V]) を輪のように使う配列に保存する（最初はすべて (0.0, 0.0)）。
+# 毎フレーム番号を 1 つずつずらして今の値を入れ、最後の番号の次は 0 番に戻る。窓は最新の点を赤い点で強調する。
+const POTENTIAL_HISTORY_FRAMES = 300        # 保存するフレームの数（60 FPS で 5 秒 = 5 周期分）
+mut potential_history = tsp.RingSeries(POTENTIAL_HISTORY_FRAMES)
 
 # 反応の矢印のグラデーションの位相 [周期]（reactions と同じ並び。advance_reaction_flows が 速さ × 画面の経過時間 だけ進める）
 mut reaction_flow_phases: list[float] = [0.0] * len(reactions)
@@ -125,7 +135,7 @@ fn set_log10_frequency(let value: float) -> None:
 #   display_seconds: 前のフレームからの画面の経過時間 [s]（rl.get_frame_time()。60 FPS なら位相 6°、1 サブステップ 0.1°）
 #   ① サブステップごとの電位を Python（waveform.sine_potentials）に 1 回でまとめて計算させる（位相はサブステップの初め）
 #   ② reaction_network.relax で、各電位の定常状態への指数的な緩和と吸着種の総和の調整を順に行い、species_pool に書き戻す
-#   simulated_seconds・phase_cycles・electrode_potential・species_pool を書き換える
+#   simulated_seconds・phase_cycles・elapsed_periods・electrode_potential・electrode_potential_periods・species_pool を書き換える
 # 例: frame_step(rl.get_frame_time())
 fn frame_step(let display_seconds: float) -> None:
     let substep_seconds = time_scale.simulated_time_step(display_seconds / SUBSTEPS_PER_FRAME, DISPLAY_SECONDS_PER_PERIOD) => float
@@ -135,6 +145,8 @@ fn frame_step(let display_seconds: float) -> None:
     simulated_seconds += substep_seconds * SUBSTEPS_PER_FRAME
     phase_cycles = (phase_cycles + phase_step_cycles * SUBSTEPS_PER_FRAME) % 1.0
     electrode_potential = env.Potential(substep_potentials[SUBSTEPS_PER_FRAME - 1])
+    electrode_potential_periods = elapsed_periods + phase_step_cycles * (SUBSTEPS_PER_FRAME - 1)   # 最後のサブステップの初めの位相
+    elapsed_periods += phase_step_cycles * SUBSTEPS_PER_FRAME
 
 # runs_backward — 今の電位・量で、逆反応の速さが正反応の速さより大きいか（矢印の向きを決める。等しければ正反応の向き）
 #   reaction: 反応
@@ -199,14 +211,20 @@ controls.add_slider("center potential [V]", -0.3, 0.3, center_potential => float
 controls.add_slider("amplitude [mV]", 0.0, 100.0, INITIAL_AMPLITUDE_MV, set_potential_amplitude_mv, 100)
 controls.add_slider("log10(frequency / Hz)", -2.0, 5.0, math.log10(INITIAL_FREQUENCY), set_log10_frequency, 700)
 
+mut potential_plot = tsp.TimeSeriesWindow("graph_visualizer potential", POTENTIAL_HISTORY_FRAMES, "Period", "E / V")
+
 mut running = True
 
 while running:
     controls.apply_changes()        # 前のフレームから動いたスライダーの分だけ set_* が呼ばれる
     frame_step(rl.get_frame_time())  # 時間を 1 フレーム進め、サブステップごとの緩和を計算して species_pool に書き戻す
+    potential_history.record(electrode_potential_periods, electrode_potential => float)   # 次の番号に今の電位を入れる
+    potential_plot.show_newest(potential_history)                                         # 入れた点を電位の窓へ送る（待たない）
     advance_reaction_flows(rl.get_frame_time())
     let screen_width = rl.get_screen_width()
     let screen_height = rl.get_screen_height()
+    # 反応のばねで、化学種と反応の中心の 力 → 速度 → 位置 を 1 フレーム分進める（半径は今の量で決まる）
+    cg.advance_spring_layout(species_pool, reactions, rl.get_frame_time(), screen_width, screen_height)
     update_selection(species_pool, screen_width, screen_height)
     rl.begin_drawing()
     rl.clear_background(cg.CANVAS_BACKGROUND_COLOR)
@@ -218,5 +236,6 @@ while running:
     running = not rl.window_should_close()
 
 controls.close()
+potential_plot.close()
 rl.close_window()
 

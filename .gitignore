@@ -14,3 +14,12 @@
 
 # Python が waveform.py を読み込んだときのキャッシュ
 __pycache__/
+
+# time_series_plot のビルド成果物（time_series_plot/build.ps1 が作る）
+/time_series_plot/bin/
+/time_series_plot/obj/
+/time_series_plot/ArrowExports.g.cs
+/time_series_plot/TimeSeriesPlotBridge.dll
+/time_series_plot/TimeSeriesPlotBridge_native.dll
+/time_series_plot/libSkiaSharp.dll
+/time_series_plot/libHarfBuzzSharp.dll

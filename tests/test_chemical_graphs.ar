@@ -15,6 +15,10 @@
 #   6. 反応の矢印: 速度定数 → 流れる速さ（0.5〜4.5 周期/秒）・反応速度 → 太さ（5〜20 px）が log10 で 1e-2〜1e6 の間だけ変わる、
 #      円の縁の点、基質 → 中心は矢じりなし・中心 → 生成物は矢じりあり・緩やかに曲がる・中心の点、反応の化学種が無ければ ValueError、
 #      is_backward なら向きが逆（生成物 → 中心 → 基質。矢じりは基質の手前）
+#   7. ばね: 質量は半径に比例・反応の中心は量 0.5 と同じ重さ・ばねの力の向きと大きさ・1 フレームの速度と位置・
+#      運動量の和は 0・長いフレームは頭打ち・減衰してばねと反発のつり合いに落ち着く・化学種が無ければ ValueError
+#      反発: -2 乗と -6 乗の項の和（遠いと -2 乗、近いと -6 乗が主）・頭打ち・向き・つながっていない 2 つは離れ、
+#      軽いほうが質量の比だけ速い
 # 期待と違えば RuntimeError を raise して非 0 で終わる。
 
 # ⚠ rl は cg より先に import する。raylib_bridge を import するモジュール（cg）を先に import すると、このファイルで構造体を
@@ -271,9 +275,9 @@ fn check_arrow_scaling() -> None:
 #   戻り値: [A, B]
 # 例: reaction_scene_species()
 fn reaction_scene_species() -> list[cg.Species]:
-    let substrate = cg.Adsorbate(name = "A", pos = cg.Position(0.2, 0.5), quantity = 0.001, color = BLUE_COLOR)
-    let product = cg.Adsorbate(name = "B", pos = cg.Position(0.8, 0.5), quantity = 0.001, color = ORANGE_COLOR)
-    let scene: list[cg.Species] = [substrate, product]
+    mut substrate = cg.Adsorbate(name = "A", pos = cg.Position(0.2, 0.5), quantity = 0.001, color = BLUE_COLOR)   # mut: let だと写しも不変で動かせない
+    mut product = cg.Adsorbate(name = "B", pos = cg.Position(0.8, 0.5), quantity = 0.001, color = ORANGE_COLOR)
+    mut scene: list[cg.Species] = [substrate, product]
     return scene
 
 # make_scene_reaction — 反応の矢印の場面の反応 A → B（中心は窓の中央）
@@ -337,11 +341,116 @@ fn draw_reaction_frames() -> None:
     rl.end_drawing()
     expect_true(raised_value_error, "drawing a reaction whose product is not in the species list is ValueError")
 
+# ---- ばねの動き（窓は使わない）----
+# 場面は反応の矢印の場面と同じ: A（中心 (160, 300)・半径 12.5・質量 0.015625）→ 反応の中心 (400, 300) → B（中心 (640, 300)）
+#   矢印の長さ = 400 - 160 - 12.5 = 227.5 px → 自然長 100 px より 127.5 px 長い → A は右へ 10 × 127.5 = 1275 の力で引かれる
+
+const SPRING_TOLERANCE = 1e-3         # 位置・速度の許容差（座標は float32 の rl.Vector2 を通る）
+const FRAME_SECONDS = 1.0 / 60.0
+
+# momentum_x — 化学種と反応の中心の運動量の x 成分の和
+#   species_list, reactions: 並び
+#   戻り値: Σ 質量 × 速度の x
+# 例: momentum_x(species, reactions)
+fn momentum_x(let species_list: list[cg.Species], let reactions: list[cg.Reaction]) -> float:
+    mut total = 0.0
+    for species in species_list:
+        total += species.get_mass() * species.get_velocity().x
+    for reaction in reactions:
+        total += reaction.get_mass() * reaction.get_velocity().x
+    return total
+
+# check_spring_layout — 7. 質量・ばねの力・1 フレームの動き・運動量・時間の頭打ち・自然長への収束
+# 例: check_spring_layout()
+fn check_spring_layout() -> None:
+    expect_close(cg.mass_for_radius(100.0), 1.0, RADIUS_TOLERANCE, "mass of radius 100 (quantity 1) is 1")
+    expect_close(cg.mass_for_radius(50.0), 0.5, RADIUS_TOLERANCE, "mass is proportional to the radius (radius 50 -> 0.5)")
+    let half_species = cg.Adsorbate(name = "half", pos = cg.Position(0.5, 0.5), quantity = 0.5, color = BLUE_COLOR)
+    expect_close(make_scene_reaction().get_mass(), half_species.get_mass(), RADIUS_TOLERANCE, "the reaction center weighs as much as a species of quantity 0.5")
+    let moved = cg.Position(0.5, 0.5).moved_by_pixels(80.0, -60.0, WINDOW_WIDTH, WINDOW_HEIGHT).to_screen(WINDOW_WIDTH, WINDOW_HEIGHT)
+    expect_true(abs(moved.x - 480.0) <= SPRING_TOLERANCE and abs(moved.y - 240.0) <= SPRING_TOLERANCE, "moved_by_pixels shifts by pixels")
+
+    let stretched = cg.spring_force_on_species(rl.Vector2(400.0, 300.0), rl.Vector2(160.0, 300.0), 12.5)
+    expect_true(abs(stretched[0] - 1275.0) <= SPRING_TOLERANCE and stretched[1] == 0.0, "a stretched spring pulls the species toward the center: " + str(stretched[0]))
+    let resting = cg.spring_force_on_species(rl.Vector2(400.0, 300.0), rl.Vector2(287.5, 300.0), 12.5)
+    expect_true(abs(resting[0]) <= SPRING_TOLERANCE and abs(resting[1]) <= SPRING_TOLERANCE, "no force at the rest length (arrow 100 px)")
+    let compressed = cg.spring_force_on_species(rl.Vector2(400.0, 300.0), rl.Vector2(350.0, 300.0), 12.5)
+    expect_true(abs(compressed[0] + 625.0) <= SPRING_TOLERANCE, "a compressed spring pushes the species away: " + str(compressed[0]))
+
+    mut species_list = reaction_scene_species()
+    mut reactions: list[cg.Reaction] = [make_scene_reaction()]
+    expect_true(species_list[0].get_velocity().x == 0.0 and reactions[0].get_velocity().x == 0.0, "velocities start at 0")
+    cg.advance_spring_layout(species_list, reactions, FRAME_SECONDS, WINDOW_WIDTH, WINDOW_HEIGHT)
+    let repulsion_on_a = -cg.repulsion_magnitude(480.0)                             # A は B（480 px 右）から左へ押される
+    let expected_speed = (1275.0 + repulsion_on_a) / species_list[0].get_mass() * FRAME_SECONDS
+    expect_close(species_list[0].get_velocity().x, expected_speed, SPRING_TOLERANCE, "one frame: A speeds toward the center ((spring + repulsion) / m × Δt)")
+    expect_close(species_list[1].get_velocity().x, -expected_speed, SPRING_TOLERANCE, "one frame: B speeds toward the center from the other side")
+    expect_close(reactions[0].get_velocity().x, 0.0, SPRING_TOLERANCE, "one frame: the forces on the symmetric center cancel")
+    expect_close(species_list[0].get_screen_center(WINDOW_WIDTH, WINDOW_HEIGHT).x, 160.0 + expected_speed * FRAME_SECONDS, SPRING_TOLERANCE, "one frame: A moves by the new velocity × Δt")
+
+    mut long_frame_species = reaction_scene_species()
+    mut long_frame_reactions: list[cg.Reaction] = [make_scene_reaction()]
+    cg.advance_spring_layout(long_frame_species, long_frame_reactions, 1.0, WINDOW_WIDTH, WINDOW_HEIGHT)
+    expect_close(long_frame_species[0].get_velocity().x, expected_speed, SPRING_TOLERANCE, "a long frame (1 s) advances only MAX_SPRING_TIME_STEP")
+
+    # 重さの違う 2 つ（A は量 1、B は量 0.001）: 反応の中心にも力が残るが、運動量の和は 0 のまま
+    mut uneven_species: list[cg.Species] = [cg.Adsorbate(name = "A", pos = cg.Position(0.2, 0.5), quantity = 1.0, color = BLUE_COLOR), reaction_scene_species()[1]]
+    mut uneven_reactions: list[cg.Reaction] = [make_scene_reaction()]
+    cg.advance_spring_layout(uneven_species, uneven_reactions, FRAME_SECONDS, WINDOW_WIDTH, WINDOW_HEIGHT)
+    expect_true(abs(uneven_reactions[0].get_velocity().x) > 1.0, "uneven arrows leave a net force on the reaction center")
+    expect_true(abs(momentum_x(uneven_species, uneven_reactions)) <= SPRING_TOLERANCE, "the total momentum stays 0 (action and reaction)")
+
+    mut frame_index = 0
+    while frame_index < 600:
+        cg.advance_spring_layout(species_list, reactions, FRAME_SECONDS, WINDOW_WIDTH, WINDOW_HEIGHT)
+        frame_index += 1
+    let center = reactions[0].get_screen_center(WINDOW_WIDTH, WINDOW_HEIGHT)
+    let arrow_length = cg.distance_between(center, species_list[0].get_screen_center(WINDOW_WIDTH, WINDOW_HEIGHT)) - species_list[0].get_radius()
+    let pair_distance = cg.distance_between(species_list[0].get_screen_center(WINDOW_WIDTH, WINDOW_HEIGHT), species_list[1].get_screen_center(WINDOW_WIDTH, WINDOW_HEIGHT))
+    let expected_stretch = cg.repulsion_magnitude(pair_distance) / cg.SPRING_CONSTANT   # 反発とつり合う分だけ伸びる
+    expect_close(arrow_length, cg.REACTION_ARROW_REST_LENGTH + expected_stretch, 0.5, "after 10 s the arrow settles where the spring balances the repulsion")
+    expect_true(abs(species_list[0].get_velocity().x) < 1.0, "after 10 s the species is nearly at rest")
+
+
+    # 化学種どうしの反発（-2 乗と -6 乗の項の和・頭打ちあり・強さは一定）
+    let repelled = cg.spring_force_on_species(rl.Vector2(0.0, 0.0), rl.Vector2(0.0, 0.0), 0.0)
+    expect_true(repelled[0] == 0.0 and repelled[1] == 0.0, "no spring force when the centers coincide")
+    expect_close(cg.repulsion_magnitude(400.0), cg.REPULSION_CONSTANT / 400.0 ** 2 + cg.CLOSE_REPULSION_CONSTANT / 400.0 ** 6, SPRING_TOLERANCE, "repulsion is the sum of the d^-2 and d^-6 terms")
+    let far_inverse_square = cg.REPULSION_CONSTANT / 600.0 ** 2
+    expect_true(cg.CLOSE_REPULSION_CONSTANT / 600.0 ** 6 < 0.01 * far_inverse_square, "far away (600 px) the d^-6 term is below 1 % of the d^-2 term")
+    expect_true(cg.CLOSE_REPULSION_CONSTANT / 130.0 ** 6 > cg.REPULSION_CONSTANT / 130.0 ** 2, "close (130 px) the d^-6 term is larger than the d^-2 term")
+    expect_true(cg.repulsion_magnitude(130.0) / cg.repulsion_magnitude(260.0) > 8.0, "halving the distance from 260 to 130 px raises the force more than 8 times (d^-2 alone gives 4)")
+    expect_close(cg.repulsion_magnitude(80.0), cg.MAX_REPULSION_FORCE, SPRING_TOLERANCE, "very close (80 px) the force stops at MAX_REPULSION_FORCE")
+    expect_close(cg.repulsion_magnitude(5.0), cg.MAX_REPULSION_FORCE, SPRING_TOLERANCE, "closer than REPULSION_MIN_DISTANCE the force is still the cap")
+    let pushed = cg.repulsion_force_on_species(rl.Vector2(600.0, 300.0), rl.Vector2(200.0, 300.0))
+    expect_close(pushed[0], cg.repulsion_magnitude(400.0), SPRING_TOLERANCE, "repulsion_force_on_species has the magnitude, away from the other")
+    let pushed_up = cg.repulsion_force_on_species(rl.Vector2(200.0, 200.0), rl.Vector2(200.0, 300.0))
+    expect_true(pushed_up[1] < 0.0 and abs(pushed_up[0]) <= SPRING_TOLERANCE, "repulsion points from the other species to the pushed one")
+    let pushed_same = cg.repulsion_force_on_species(rl.Vector2(200.0, 300.0), rl.Vector2(200.0, 300.0))
+    expect_true(pushed_same[0] == 0.0 and pushed_same[1] == 0.0, "no repulsion when the centers coincide")
+    # 反応でつながっていない 2 つ（重さが違う）は離れていき、運動量の和は 0 のまま。強さは大きさによらないので加速度は質量に反比例
+    mut lonely_species: list[cg.Species] = [cg.Adsorbate(name = "heavy", pos = cg.Position(0.45, 0.5), quantity = 1.0, color = BLUE_COLOR), cg.Adsorbate(name = "light", pos = cg.Position(0.55, 0.5), quantity = 0.001, color = ORANGE_COLOR)]
+    mut no_reactions: list[cg.Reaction] = []
+    cg.advance_spring_layout(lonely_species, no_reactions, FRAME_SECONDS, WINDOW_WIDTH, WINDOW_HEIGHT)
+    expect_true(lonely_species[0].get_velocity().x < 0.0 and lonely_species[1].get_velocity().x > 0.0, "two unconnected species push each other apart")
+    expect_true(abs(momentum_x(lonely_species, no_reactions)) <= SPRING_TOLERANCE, "repulsion keeps the total momentum 0")
+    expect_close(lonely_species[1].get_velocity().x / -lonely_species[0].get_velocity().x, lonely_species[0].get_mass() / lonely_species[1].get_mass(), SPRING_TOLERANCE, "the same force: the lighter (smaller) species moves faster by the mass ratio")
+
+    let missing_species: list[cg.Species] = [reaction_scene_species()[0]]
+    mut raised_value_error = False
+    try:
+        mut missing_copy = missing_species
+        cg.advance_spring_layout(missing_copy, reactions, FRAME_SECONDS, WINDOW_WIDTH, WINDOW_HEIGHT)
+    except ValueError:
+        raised_value_error = True
+    expect_true(raised_value_error, "a reaction species missing from the list is ValueError")
+
 # ---- 本体 ----
 check_radius()
 check_position()
 check_hit_test()
 check_arrow_scaling()
+check_spring_layout()
 
 rl.set_trace_log_level(rlc.LOG_WARNING)
 rl.set_config_flags(rlc.FLAG_WINDOW_HIDDEN)
