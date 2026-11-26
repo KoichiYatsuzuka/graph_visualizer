@@ -6,10 +6,62 @@ new_type Time: float
 
 new_type Frequency: float
 
+# check_frequency — 周波数が正で有限か確かめる。そうでなければ ValueError
+#   applied_frequency: 確かめる周波数 [Hz]
+# 例: check_frequency(Frequency(10.0))
+fn check_frequency(let applied_frequency: Frequency) -> None:
+    let frequency_value = applied_frequency => float
+    if not (frequency_value > 0.0 and frequency_value < float("inf")):
+        raise ValueError("applied_frequency must be finite and positive, got " + str(frequency_value))
+
+# TimeScale — 加える電位の周波数と、その 1 周期の長さ（シミュレーションの時間の尺度）
+#   メンバー:
+#     period_length: Time（private）— 1 周期の長さ [s]（常に 1 / applied_frequency）
+#     applied_frequency: Frequency（private）— 加える電位の周波数 [Hz]
+#     __init__(applied_frequency) — 周波数から作る（正で有限でなければ ValueError）
+#     set_applied_frequency(applied_frequency) -> None — 周波数を変える（period_length も合わせて変わる）
+#     get_applied_frequency() -> Frequency / get_period_length() -> Time — 周波数・周期を返す
+#     simulated_time_step(display_seconds, display_seconds_per_period) -> Time — 画面の経過時間をシミュレーションの時間に換算する
+# 例: mut time_scale = TimeScale(Frequency(10.0))   # 周期 0.1 s
 class TimeScale:
     private:
     mut period_length: Time
 
     mut applied_frequency: Frequency
 
-    
+    public:
+    # __init__ — 周波数から作る
+    #   applied_frequency: 加える電位の周波数 [Hz]（正で有限。そうでなければ ValueError）
+    fn __init__(mut self, let applied_frequency: Frequency) -> Self:
+        check_frequency(applied_frequency)
+        self.applied_frequency = applied_frequency
+        self.period_length = Time(1.0 / (applied_frequency => float))
+        return self
+
+    # set_applied_frequency — 周波数を変える。period_length も 1 / applied_frequency に変わる。⚠ self を書き換える
+    #   applied_frequency: 新しい周波数 [Hz]（正で有限。そうでなければ ValueError で、値は変わらない）
+    # 例: time_scale.set_applied_frequency(Frequency(100.0))
+    fn set_applied_frequency(mut self, let applied_frequency: Frequency) -> None:
+        check_frequency(applied_frequency)
+        self.applied_frequency = applied_frequency
+        self.period_length = Time(1.0 / (applied_frequency => float))
+
+    # get_applied_frequency — 周波数を返す
+    #   戻り値: 周波数 [Hz]
+    # 例: time_scale.get_applied_frequency() => float   # 10.0
+    fn get_applied_frequency(let self) -> Frequency:
+        return self.applied_frequency
+
+    # get_period_length — 1 周期の長さを返す
+    #   戻り値: 1 / applied_frequency [s]
+    # 例: time_scale.get_period_length() => float   # 0.1（10 Hz のとき）
+    fn get_period_length(let self) -> Time:
+        return self.period_length
+
+    # simulated_time_step — 画面の経過時間を、シミュレーションの時間に換算する（画面の display_seconds_per_period 秒で 1 周期進む）
+    #   display_seconds: 画面の経過時間 [s]（rl.get_frame_time() など）
+    #   display_seconds_per_period: 画面の何秒で 1 周期を見せるか [s]（正）
+    #   戻り値: display_seconds / display_seconds_per_period * period_length [s]
+    # 例: time_scale.simulated_time_step(0.5, 1.0) => float   # 0.05（10 Hz・画面の 1 秒で 1 周期なら半周期）
+    fn simulated_time_step(let self, let display_seconds: float, let display_seconds_per_period: float) -> Time:
+        return Time(display_seconds / display_seconds_per_period * (self.period_length => float))

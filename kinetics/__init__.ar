@@ -1,0 +1,598 @@
+# kinetics — 反応の速度定数（Butler-Volmer 関係式）、反応速度（質量作用）、化学種の量の時間発展
+#
+# chemical_graphs（化学種と反応のつながり・描画）は kinetics を知らない。kinetics が chemical_graphs の
+# Reaction / Species を読み、量を書き換える（依存は kinetics → chemical_graphs の一方向）。
+# 数値計算は ReactionNetwork（化学種・反応を番号で引ける表）の上で、量を list[float] にして行い、最後に化学種へ書き戻す
+# （名前の辞書やメソッドの呼び出しを繰り返さないため。1 フレームに 60 回の定常状態の計算を 60 FPS に収める速さが要る）。
+#
+# 量の単位: 吸着種は被覆率、溶存種は濃度（活量）として、そのまま質量作用の式に入れる。単位の換算はしない。
+# 電位: main.ar が決めた env.Potential を、速度定数を計算するたびに引数で渡す（反応の中には持たない）。
+
+import ..environment as env
+import ..chemical_graphs as cg
+
+const R: float = 8.31446261815324      # 気体定数 [J/(mol K)] = k_B N_A（SI 2019 の定義値の積）
+const ROOM_TEMP: float = 298.0
+const F: float = 96485.33212331001     # ファラデー定数 [C/mol] = e N_A（SI 2019 の定義値の積）
+
+# 定常状態の計算（ReactionNetwork.steady_state）の設定
+const STEADY_STATE_STIFFNESS = 1.0e4        # 擬似時間刻み h = STEADY_STATE_STIFFNESS / 最大の速度定数（大きいほど 1 回で定常に近づくが、
+                                            # 連立方程式の条件が悪くなり被覆率の和の丸め誤差が増える。1e6 で 1e-11 程度だった）
+const STEADY_STATE_MAX_ITERATIONS = 50      # この回数で収束しなければ RuntimeError
+const STEADY_STATE_TOLERANCE = 1e-12        # 1 回の量の変化の最大値がこれ以下なら収束とみなす（settle_to_steady_state）
+
+# 緩和の計算（ReactionNetwork.relax）の設定
+const RELAXATION_STEADY_STATE_TOLERANCE = 1e-8    # 各サブステップの定常状態の収束の判定（前のサブステップの定常状態から始めるので、ふつう 2 回で
+                                                  # 変化がこれ以下になる。そのときの定常状態の誤差は 1e-12 程度。1e-10 だと 3 回かかり 60 FPS に収まりにくい）
+const RELAXATION_GAP_FLOOR = 1e-12                # 定常状態との差がこれ以下なら、割線で緩和の速さを求めず Jacobian の対角を使う
+const ADSORBATE_TOTAL = 1.0                       # 吸着種（Adsorbate）の量の総和（被覆率の和。relax が各サブステップの後にこれへ合わせる）
+
+# TransferDirection — 電子移動の向き（electron_transfer_k_generator が、電位が下がると速くなるか上がると速くなるかを決める）
+#   reduction: 還元（電子を受け取る）。電位が下がるほど速い
+#   oxidation: 酸化（電子を渡す）。電位が上がるほど速い
+enum TransferDirection:
+    reduction
+    oxidation
+
+# butler_volmer_k — 素反応の速度定数を Butler-Volmer 関係式の指数の形で返す
+#   over_potential: 平衡電位からの電位差 [V]（向きは呼ぶ側で決める。electron_transfer_k_generator を参照）
+#   electron_transfer_coefficient: 指数にかかる電荷移動係数（還元なら α、酸化なら 1 - α）
+#   k0: 平衡電位における速度定数
+#   temp: 温度 [K]
+#   戻り値: k0 * exp(electron_transfer_coefficient * F * over_potential / (R * temp))
+# 例: butler_volmer_k(0.0, 0.5, 2.0)   # 2.0（平衡電位では k0）
+fn butler_volmer_k(
+    let over_potential: float,
+    let electron_transfer_coefficient: float,
+    let k0: float,
+    let temp: float = ROOM_TEMP
+)->float:
+    return k0 * exp((electron_transfer_coefficient*F*over_potential)/(temp*R))
+
+
+# check_butler_volmer_parameters — Butler-Volmer 関係式のパラメータを確かめる。おかしければ ValueError
+#   center_potential: 素反応の平衡電位 [V]（有限）
+#   k0: 平衡電位における速度定数（0 以上・有限）
+#   electron_transfer_coefficient: 電荷移動係数 α（0 以上 1 以下）
+#   temp: 温度 [K]（正・有限）
+# 例: check_butler_volmer_parameters(0.1, 1.0, 0.5, ROOM_TEMP)
+fn check_butler_volmer_parameters(let center_potential: float, let k0: float, let electron_transfer_coefficient: float, let temp: float) -> None:
+    if not (abs(center_potential) < float("inf")):
+        raise ValueError("center_potential must be finite, got " + str(center_potential))
+    if not (k0 >= 0.0 and k0 < float("inf")):
+        raise ValueError("k0 must be finite and 0 or more, got " + str(k0))
+    if not (electron_transfer_coefficient >= 0.0 and electron_transfer_coefficient <= 1.0):
+        raise ValueError("electron_transfer_coefficient must be between 0 and 1, got " + str(electron_transfer_coefficient))
+    if not (temp > 0.0 and temp < float("inf")):
+        raise ValueError("temp must be finite and positive, got " + str(temp))
+
+# electron_transfer_k_generator — 電子移動を含む素反応の速度定数の関数（Reaction に渡す cg.Fn_RateCoefficient）を作る
+#   center_potential: 素反応の平衡電位 E0 [V]
+#   k0: 平衡電位における速度定数
+#   electron_transfer_coefficient: 電荷移動係数 α（0〜1）
+#   direction: 電子移動の向き
+#   temp: 温度 [K]
+#   戻り値: (reaction, potential) を受けて、η = potential - E0 として
+#           還元なら k0 * exp(-α F η / (R T))、酸化なら k0 * exp((1 - α) F η / (R T)) を返す関数
+#   パラメータがおかしければ ValueError（check_butler_volmer_parameters）
+#   ⚠ 符号の規約（η = E - E0、還元は α・酸化は 1 - α）は一般的な形。研究室の規約と違えば直す
+# 例: let volmer_fw = electron_transfer_k_generator(0.1, 1.0, 0.5, TransferDirection.reduction)
+fn electron_transfer_k_generator(
+    let center_potential: float,
+    let k0: float,
+    let electron_transfer_coefficient: float,
+    let direction: TransferDirection,
+    let temp: float = ROOM_TEMP
+)->cg.Fn_RateCoefficient:
+    check_butler_volmer_parameters(center_potential, k0, electron_transfer_coefficient, temp)
+
+    # rate_coefficient — 電位 potential での速度定数（reaction は使わない。被覆率に依存する速度定数などのための引数）
+    fn rate_coefficient(let reaction: cg.Reaction, let potential: env.Potential) -> float:
+        let over_potential = (potential => float) - center_potential
+        if direction == TransferDirection.reduction:
+            return butler_volmer_k(-over_potential, electron_transfer_coefficient, k0, temp)
+        return butler_volmer_k(over_potential, 1.0 - electron_transfer_coefficient, k0, temp)
+
+    return cg.Fn_RateCoefficient(rate_coefficient)
+
+# butler_volmer_k_pair — 還元を正反応とする素反応の、正・逆反応の速度定数の関数の組を作る（同じ E0・k0・α を共有させる）
+#   center_potential, k0, electron_transfer_coefficient, temp: electron_transfer_k_generator と同じ
+#   戻り値: (正反応 = 還元の関数, 逆反応 = 酸化の関数)。正 / 逆の比は exp(-F (E - E0) / (R T)) で、E = E0 で 1
+# 例: let volmer_fw, let volmer_bw = butler_volmer_k_pair(0.1, 1.0, 0.5)
+fn butler_volmer_k_pair(
+    let center_potential: float,
+    let k0: float,
+    let electron_transfer_coefficient: float,
+    let temp: float = ROOM_TEMP
+)->tuple[cg.Fn_RateCoefficient, cg.Fn_RateCoefficient]:
+    let forward = electron_transfer_k_generator(center_potential, k0, electron_transfer_coefficient, TransferDirection.reduction, temp)
+    let backward = electron_transfer_k_generator(center_potential, k0, electron_transfer_coefficient, TransferDirection.oxidation, temp)
+    return (forward, backward)
+
+
+# ---- 反応速度（質量作用・名前で引く形） ----
+
+# quantities_by_name — 化学種の名前から今の量を引く辞書を作る
+#   species_list: 化学種の並び（名前は重複しないこと。重複すれば ValueError）
+#   戻り値: {名前: 量}
+# 例: net_rate(volmer, quantities_by_name(species_pool), env.Potential(-0.1))
+fn quantities_by_name(let species_list: list[cg.Species]) -> dict[str, float]:
+    mut quantities: dict[str, float] = {}
+    for species in species_list:
+        if species.name in quantities:
+            raise ValueError("two species share the name '" + species.name + "'; names must be unique")
+        quantities[species.name] = species.get_quantity()
+    return quantities
+
+# mass_action_product — 反応式の片側の Π q^ν（質量作用の濃度の項）を返す
+#   entries: 反応式の片側の項
+#   quantities: {名前: 量}
+#   戻り値: 各項の 量 ** 係数 の積（項が無ければ 1.0）
+# 例: mass_action_product(volmer.node_A, {"H+": 1.0, "vacancy": 0.2, "H_ads": 0.8})   # 0.2
+fn mass_action_product(let entries: list[cg.Stoichiometry], let quantities: dict[str, float]) -> float:
+    mut product = 1.0
+    for entry in entries:
+        product *= quantities[entry.species.name] ** entry.ratio
+    return product
+
+# net_rate — 反応の正味の速さ（正反応 - 逆反応）を質量作用で返す（1 つの反応を調べる用。時間発展は ReactionNetwork が行う）
+#   reaction: 反応
+#   quantities: {名前: 量}（quantities_by_name の戻り値）
+#   potential: 電極の電位（main.ar が決めた値）
+#   戻り値: k_f(potential) Π_A q^ν - k_b(potential) Π_B q^ν（正なら node_A → node_B に進む）
+# 例: net_rate(volmer, quantities_by_name(species_pool), env.Potential(-0.1))
+fn net_rate(let reaction: cg.Reaction, let quantities: dict[str, float], let potential: env.Potential) -> float:
+    let forward_rate = reaction.forward_rate_coefficient(potential) * mass_action_product(reaction.node_A, quantities)
+    let backward_rate = reaction.backward_rate_coefficient(potential) * mass_action_product(reaction.node_B, quantities)
+    return forward_rate - backward_rate
+
+# forward_reaction_rate — 正反応の速さ（速度定数 × 基質の量の積）を返す（矢印の太さに使う）
+#   reaction: 反応
+#   quantities: {名前: 量}（quantities_by_name の戻り値）
+#   potential: 電極の電位
+#   戻り値: k_f(potential) Π_A q^ν（逆反応は引かない）
+# 例: forward_reaction_rate(volmer, quantities_by_name(species_pool), env.Potential(-0.1))
+fn forward_reaction_rate(let reaction: cg.Reaction, let quantities: dict[str, float], let potential: env.Potential) -> float:
+    return reaction.forward_rate_coefficient(potential) * mass_action_product(reaction.node_A, quantities)
+
+# backward_reaction_rate — 逆反応の速さ（逆反応の速度定数 × 生成物の量の積）を返す（矢印の向きと太さに使う）
+#   reaction: 反応
+#   quantities: {名前: 量}（quantities_by_name の戻り値）
+#   potential: 電極の電位
+#   戻り値: k_b(potential) Π_B q^ν（正反応は引かない。is_reversible が False なら 0.0）
+# 例: backward_reaction_rate(volmer, quantities_by_name(species_pool), env.Potential(0.1))
+fn backward_reaction_rate(let reaction: cg.Reaction, let quantities: dict[str, float], let potential: env.Potential) -> float:
+    return reaction.backward_rate_coefficient(potential) * mass_action_product(reaction.node_B, quantities)
+
+
+# ---- 連立一次方程式 ----
+
+# solve_linear_system — 連立一次方程式 matrix x = right_hand_side を部分ピボット付きのガウスの消去法で解く
+#   matrix: 正方行列（行の並び。size x size）
+#   right_hand_side: 右辺（長さ size）
+#   戻り値: 解 x（長さ size）
+#   大きさが合わなければ ValueError、特異（ピボットが 0）なら ValueError
+# 例: solve_linear_system([[2.0, 0.0], [0.0, 4.0]], [2.0, 2.0])   # [1.0, 0.5]
+fn solve_linear_system(let matrix: list[list[float]], let right_hand_side: list[float]) -> list[float]:
+    let size = len(right_hand_side)
+    if len(matrix) != size:
+        raise ValueError("matrix has " + str(len(matrix)) + " rows but right_hand_side has " + str(size) + " values")
+    mut augmented: list[list[float]] = []
+    for row_index in range(size):
+        if len(matrix[row_index]) != size:
+            raise ValueError("row " + str(row_index) + " of matrix has " + str(len(matrix[row_index])) + " values, expected " + str(size))
+        mut augmented_row: list[float] = matrix[row_index]
+        augmented_row.append(right_hand_side[row_index])
+        augmented.append(augmented_row)
+    mut row_order: list[int] = list(range(size))     # 行の入れ替えは番号だけで行う
+    for pivot_column in range(size):
+        mut pivot_position = pivot_column
+        for candidate_position in range(pivot_column + 1, size):
+            if abs(augmented[row_order[candidate_position]][pivot_column]) > abs(augmented[row_order[pivot_position]][pivot_column]):
+                pivot_position = candidate_position
+        let pivot_row = row_order[pivot_position]
+        let pivot_value = augmented[pivot_row][pivot_column]
+        if pivot_value == 0.0:
+            raise ValueError("matrix is singular")
+        row_order[pivot_position] = row_order[pivot_column]
+        row_order[pivot_column] = pivot_row
+        for target_position in range(pivot_column + 1, size):
+            let target_row = row_order[target_position]
+            let factor = augmented[target_row][pivot_column] / pivot_value
+            for column in range(pivot_column, size + 1):
+                augmented[target_row][column] -= factor * augmented[pivot_row][column]
+    mut solution: list[float] = [0.0] * size
+    for position in range(size - 1, -1, -1):
+        let row = row_order[position]
+        mut remaining = augmented[row][size]
+        for column in range(position + 1, size):
+            remaining -= augmented[row][column] * solution[column]
+        solution[position] = remaining / augmented[row][position]
+    return solution
+
+
+# ---- 反応網（番号で引く計算用の表） ----
+
+# species_positions — 化学種の名前から species_list での番号を引く辞書を作る
+#   species_list: 化学種の並び（名前が重複すれば ValueError）
+#   戻り値: {名前: 番号}
+# 例: species_positions(species_pool)["H_ads"]   # 1
+fn species_positions(let species_list: list[cg.Species]) -> dict[str, int]:
+    mut positions: dict[str, int] = {}
+    for position in range(len(species_list)):
+        let species_name = species_list[position].name
+        if species_name in positions:
+            raise ValueError("two species share the name '" + species_name + "'; names must be unique")
+        positions[species_name] = position
+    return positions
+
+# term_positions — 反応式の片側の各項の化学種の番号を返す
+#   entries: 反応式の片側の項
+#   positions: species_positions の戻り値
+#   戻り値: 各項の化学種の番号。species_list に無い化学種があれば ValueError
+# 例: term_positions(volmer.node_A, species_positions(species_pool))   # [3, 0]
+fn term_positions(let entries: list[cg.Stoichiometry], let positions: dict[str, int]) -> list[int]:
+    mut found: list[int] = []
+    for entry in entries:
+        if entry.species.name not in positions:
+            raise ValueError("species '" + entry.species.name + "' of a reaction is not in the species list")
+        found.append(positions[entry.species.name])
+    return found
+
+# term_ratios — 反応式の片側の各項の係数を返す
+#   entries: 反応式の片側の項
+#   戻り値: 各項の係数
+# 例: term_ratios(volmer.node_A)   # [1, 1]
+fn term_ratios(let entries: list[cg.Stoichiometry]) -> list[int]:
+    mut ratios: list[int] = []
+    for entry in entries:
+        ratios.append(entry.ratio)
+    return ratios
+
+# product_of_terms — 番号で表した反応式の片側の Π q^ν を返す
+#   term_species: 各項の化学種の番号
+#   ratios: 各項の係数
+#   quantities: 番号ごとの量
+#   戻り値: 各項の 量 ** 係数 の積（項が無ければ 1.0）
+# 例: product_of_terms([1], [2], [0.3, 0.7])   # 0.49
+fn product_of_terms(let term_species: list[int], let ratios: list[int], let quantities: list[float]) -> float:
+    mut product = 1.0
+    for term_index in range(len(term_species)):
+        product *= quantities[term_species[term_index]] ** ratios[term_index]
+    return product
+
+# product_of_terms_derivative — product_of_terms を番号 species_position の量で偏微分した値を返す
+#   term_species, ratios, quantities: product_of_terms と同じ
+#   species_position: 微分する量の化学種の番号
+#   戻り値: Σ（その化学種の項 e について）ν_e q^(ν_e - 1) × （e 以外の項の q^ν の積）。出てこなければ 0.0
+# 例: product_of_terms_derivative([1], [2], [0.3, 0.7], 1)   # 2 * 0.7 = 1.4
+fn product_of_terms_derivative(let term_species: list[int], let ratios: list[int], let quantities: list[float], let species_position: int) -> float:
+    mut derivative = 0.0
+    for differentiated_index in range(len(term_species)):
+        if term_species[differentiated_index] == species_position:
+            let ratio = ratios[differentiated_index]
+            mut term = ratio * quantities[species_position] ** (ratio - 1)
+            for other_index in range(len(term_species)):
+                if other_index != differentiated_index:
+                    term *= quantities[term_species[other_index]] ** ratios[other_index]
+            derivative += term
+    return derivative
+
+# largest_change — 2 つの量の並びの差の絶対値の最大を返す
+#   before, after: 同じ長さの量の並び
+#   戻り値: max |after[i] - before[i]|（空なら 0.0）
+# 例: largest_change([0.5, 0.5], [0.75, 0.25])   # 0.25
+fn largest_change(let before: list[float], let after: list[float]) -> float:
+    mut largest = 0.0
+    for position in range(len(before)):
+        largest = max(largest, abs(after[position] - before[position]))
+    return largest
+
+# check_time_step — 時間刻みが 0 以上で有限か確かめる。そうでなければ ValueError
+#   time_step: 時間刻み [s]
+# 例: check_time_step(0.01)
+fn check_time_step(let time_step: float) -> None:
+    if not (time_step >= 0.0 and time_step < float("inf")):
+        raise ValueError("time_step must be finite and 0 or more, got " + str(time_step))
+
+# ReactionNetwork — 化学種の並びと反応の並びを、番号で引ける計算用の表にしたもの（作るのは 1 回。量は持たない）
+#   量は species_list での番号を添字にした list[float]（read_quantities で読み、write_quantities で書き戻す）。
+#   メンバー（フィールドはすべて private・不変）:
+#     reactions: list[cg.Reaction] — 反応（速度定数の関数を呼ぶ）
+#     species_names: list[str] — 作ったときの化学種の名前（番号順。read_quantities が並びの一致を確かめる）
+#     variable_positions: list[int] — 量が変わる化学種（is_quantity_fixed でない）の番号
+#     adsorbate_positions: list[int] — 吸着種（cg.Adsorbate）の番号（relax が緩和させ、総和を ADSORBATE_TOTAL に合わせる）
+#     reactant_species / reactant_ratios: list[list[int]] — 反応ごとの左辺の項の化学種の番号・係数
+#     product_species / product_ratios: list[list[int]] — 反応ごとの右辺の項の化学種の番号・係数
+#     stoichiometry: list[list[int]] — [反応][化学種の番号] の、正反応 1 回での数の変化
+#     read_quantities(species_list) -> list[float] / write_quantities(species_list, quantities) -> None
+#     rate_coefficients(potential) -> list[list[float]] — [正反応の速度定数の並び, 逆反応の速度定数の並び]
+#     net_rates(quantities, coefficients) -> list[float] — 反応ごとの正味の速さ（質量作用）
+#     time_derivatives(quantities, coefficients) -> list[float] — 番号ごとの d q / d t（量が一定の化学種は 0）
+#     jacobian_entry(row_position, column_position, quantities, coefficients) -> float — ∂(d q_row / d t) / ∂ q_column
+#     implicit_step(quantities, coefficients, time_step) -> list[float] — 線形陰的オイラー法の 1 歩
+#     steady_state(quantities, coefficients, tolerance) -> tuple[list[float], int] — 定常状態と、かかった回数
+#     relaxed_toward(quantities, steady, coefficients, time_step) -> list[float] — 吸着種を定常状態へ指数的に緩和させる
+#     relaxation_rate(position, quantities, steady, derivatives, coefficients) -> float — 緩和の速さ λ の見積もり
+#     normalized_adsorbates(quantities) -> list[float] — 吸着種の総和を ADSORBATE_TOTAL に合わせる
+#     relax(species_list, potentials, time_step) -> None — 電位の並びに沿って緩和の計算を進め、化学種へ書き戻す
+# 例: let network = ReactionNetwork(species_pool, [volmer, heyrovsky])
+#     network.relax(species_pool, potentials, substep_seconds)
+class ReactionNetwork:
+    private:
+    let reactions: list[cg.Reaction]
+    let species_names: list[str]
+    let variable_positions: list[int]
+    let adsorbate_positions: list[int]
+    let reactant_species: list[list[int]]
+    let reactant_ratios: list[list[int]]
+    let product_species: list[list[int]]
+    let product_ratios: list[list[int]]
+    let stoichiometry: list[list[int]]
+
+    public:
+    # __init__ — 化学種の並びと反応の並びから表を作る
+    #   species_list: 化学種の並び（後で read_quantities / relax に渡す並びと同じ順・同じ名前。名前の重複は ValueError）
+    #   reactions: 反応の並び（反応に出てくる化学種が species_list に無ければ ValueError）
+    fn __init__(mut self, let species_list: list[cg.Species], let reactions: list[cg.Reaction]) -> Self:
+        let positions = species_positions(species_list)
+        mut species_names: list[str] = []
+        mut variable_positions: list[int] = []
+        mut adsorbate_positions: list[int] = []
+        for position in range(len(species_list)):
+            species_names.append(species_list[position].name)
+            if not species_list[position].is_quantity_fixed():
+                variable_positions.append(position)
+            if species_list[position] is cg.Adsorbate:
+                adsorbate_positions.append(position)
+        mut reactant_species: list[list[int]] = []
+        mut reactant_ratios: list[list[int]] = []
+        mut product_species: list[list[int]] = []
+        mut product_ratios: list[list[int]] = []
+        mut stoichiometry: list[list[int]] = []
+        for reaction in reactions:
+            reactant_species.append(term_positions(reaction.node_A, positions))
+            reactant_ratios.append(term_ratios(reaction.node_A))
+            product_species.append(term_positions(reaction.node_B, positions))
+            product_ratios.append(term_ratios(reaction.node_B))
+            mut changes: list[int] = [0] * len(species_list)
+            for species_name in reaction.species_names():
+                changes[positions[species_name]] = reaction.net_stoichiometry(species_name)
+            stoichiometry.append(changes)
+        self.reactions = reactions
+        self.species_names = species_names
+        self.variable_positions = variable_positions
+        self.adsorbate_positions = adsorbate_positions
+        self.reactant_species = reactant_species
+        self.reactant_ratios = reactant_ratios
+        self.product_species = product_species
+        self.product_ratios = product_ratios
+        self.stoichiometry = stoichiometry
+        return self
+
+    # read_quantities — 化学種の今の量を番号順の並びにして返す
+    #   species_list: 作ったときと同じ順・同じ名前の化学種の並び（違えば ValueError）
+    #   戻り値: 番号ごとの量
+    # 例: let quantities = network.read_quantities(species_pool)
+    fn read_quantities(let self, let species_list: list[cg.Species]) -> list[float]:
+        if len(species_list) != len(self.species_names):
+            raise ValueError("species_list has " + str(len(species_list)) + " species, but the network was built with " + str(len(self.species_names)))
+        mut quantities: list[float] = []
+        for position in range(len(species_list)):
+            if species_list[position].name != self.species_names[position]:
+                raise ValueError("species " + str(position) + " is '" + species_list[position].name + "', but the network was built with '" + self.species_names[position] + "'")
+            quantities.append(species_list[position].get_quantity())
+        return quantities
+
+    # write_quantities — 番号ごとの量を化学種へ書き戻す（量が変わる化学種だけ。change_quantity で差を足す）
+    #   species_list: read_quantities に渡したのと同じ化学種の並び。⚠ 量が書き換わる
+    #   quantities: 番号ごとの新しい量
+    # 例: network.write_quantities(species_pool, quantities)
+    fn write_quantities(let self, mut species_list: list[cg.Species], let quantities: list[float]) -> None:
+        for position in self.variable_positions:
+            species_list[position].change_quantity(quantities[position] - species_list[position].get_quantity())
+
+    # rate_coefficients — 電位 potential での、反応ごとの正・逆反応の速度定数を返す
+    #   potential: 電極の電位
+    #   戻り値: [正反応の速度定数の並び, 逆反応の速度定数の並び]（反応の順）
+    # 例: let coefficients = network.rate_coefficients(env.Potential(-0.1))
+    fn rate_coefficients(let self, let potential: env.Potential) -> list[list[float]]:
+        mut forward: list[float] = []
+        mut backward: list[float] = []
+        for reaction in self.reactions:
+            forward.append(reaction.forward_rate_coefficient(potential))
+            backward.append(reaction.backward_rate_coefficient(potential))
+        return [forward, backward]
+
+    # net_rates — 反応ごとの正味の速さ（正反応 - 逆反応）を質量作用で返す
+    #   quantities: 番号ごとの量
+    #   coefficients: rate_coefficients の戻り値
+    #   戻り値: k_f Π_A q^ν - k_b Π_B q^ν の並び（反応の順）
+    # 例: network.net_rates(quantities, coefficients)
+    fn net_rates(let self, let quantities: list[float], let coefficients: list[list[float]]) -> list[float]:
+        mut rates: list[float] = []
+        for reaction_index in range(len(self.reactions)):
+            let forward_rate = coefficients[0][reaction_index] * product_of_terms(self.reactant_species[reaction_index], self.reactant_ratios[reaction_index], quantities)
+            let backward_rate = coefficients[1][reaction_index] * product_of_terms(self.product_species[reaction_index], self.product_ratios[reaction_index], quantities)
+            rates.append(forward_rate - backward_rate)
+        return rates
+
+    # time_derivatives — 番号ごとの d q / d t = Σ_反応 （数の変化）×（正味の速さ）を返す
+    #   quantities: 番号ごとの量
+    #   coefficients: rate_coefficients の戻り値
+    #   戻り値: 番号ごとの d q / d t（量が一定の化学種は 0.0）
+    # 例: network.time_derivatives(quantities, coefficients)[1]   # H_ads の増える速さ
+    fn time_derivatives(let self, let quantities: list[float], let coefficients: list[list[float]]) -> list[float]:
+        let rates = self.net_rates(quantities, coefficients)
+        mut derivatives: list[float] = [0.0] * len(self.species_names)
+        for reaction_index in range(len(rates)):
+            for position in self.variable_positions:
+                derivatives[position] += self.stoichiometry[reaction_index][position] * rates[reaction_index]
+        return derivatives
+
+    # jacobian_entry — d q_row / d t を q_column で偏微分した値（解析的）を返す
+    #   row_position, column_position: 化学種の番号
+    #   quantities: 番号ごとの量
+    #   coefficients: rate_coefficients の戻り値
+    #   戻り値: Σ_反応 （row の数の変化）×（k_f ∂Π_A/∂q_column - k_b ∂Π_B/∂q_column）
+    # 例: network.jacobian_entry(1, 1, quantities, coefficients)   # H_ads 自身による変化（符号は負）
+    fn jacobian_entry(let self, let row_position: int, let column_position: int, let quantities: list[float], let coefficients: list[list[float]]) -> float:
+        mut entry = 0.0
+        for reaction_index in range(len(self.reactions)):
+            let change = self.stoichiometry[reaction_index][row_position]
+            if change != 0:
+                let forward_slope = coefficients[0][reaction_index] * product_of_terms_derivative(self.reactant_species[reaction_index], self.reactant_ratios[reaction_index], quantities, column_position)
+                let backward_slope = coefficients[1][reaction_index] * product_of_terms_derivative(self.product_species[reaction_index], self.product_ratios[reaction_index], quantities, column_position)
+                entry += change * (forward_slope - backward_slope)
+        return entry
+
+    # implicit_step — 量を time_step だけ進める（線形陰的オイラー法: (I - h J) Δq = h f(q)。量が変わる化学種だけが未知数）
+    #   quantities: 番号ごとの量
+    #   coefficients: rate_coefficients の戻り値
+    #   time_step: 進める時間 h [s]（0 以上）
+    #   戻り値: 進めた後の番号ごとの量（陰的なので h が大きくても発散せず、線形な保存量は保たれる）
+    # 例: let next_quantities = network.implicit_step(quantities, coefficients, 0.01)
+    fn implicit_step(let self, let quantities: list[float], let coefficients: list[list[float]], let time_step: float) -> list[float]:
+        let variable_count = len(self.variable_positions)
+        if variable_count == 0 or time_step == 0.0:
+            return quantities
+        let derivatives = self.time_derivatives(quantities, coefficients)
+        mut matrix: list[list[float]] = []          # I - h J
+        mut right_hand_side: list[float] = []       # h f(q)
+        for row in range(variable_count):
+            let row_position = self.variable_positions[row]
+            mut matrix_row: list[float] = []
+            for column in range(variable_count):
+                matrix_row.append(-time_step * self.jacobian_entry(row_position, self.variable_positions[column], quantities, coefficients))
+            matrix_row[row] += 1.0                  # 単位行列 I の対角
+            matrix.append(matrix_row)
+            right_hand_side.append(time_step * derivatives[row_position])
+        let changes = solve_linear_system(matrix, right_hand_side)
+        mut stepped: list[float] = quantities
+        for row in range(variable_count):
+            stepped[self.variable_positions[row]] += changes[row]
+        return stepped
+
+    # steady_state — その速度定数での定常状態（d q / d t = 0）を求める
+    #   quantities: 始めの番号ごとの量（近いほど早く収束する）
+    #   coefficients: rate_coefficients の戻り値
+    #   tolerance: 1 回の量の変化の最大値がこれ以下なら収束とみなす
+    #   戻り値: (定常状態の番号ごとの量, implicit_step を呼んだ回数)。速度定数がすべて 0 なら (quantities, 0)
+    #   擬似時間刻み h = STEADY_STATE_STIFFNESS / 最大の速度定数 で implicit_step を繰り返す（線形な保存量は保たれる）。
+    #   速度定数が無限大なら ValueError、STEADY_STATE_MAX_ITERATIONS 回で収束しなければ RuntimeError
+    # 例: let steady = network.steady_state(quantities, coefficients, STEADY_STATE_TOLERANCE)[0]
+    fn steady_state(let self, let quantities: list[float], let coefficients: list[list[float]], let tolerance: float) -> tuple[list[float], int]:
+        mut largest_coefficient = 0.0
+        for side in coefficients:
+            for coefficient in side:
+                largest_coefficient = max(largest_coefficient, coefficient)
+        if largest_coefficient == 0.0:
+            return (quantities, 0)
+        if not (largest_coefficient < float("inf")):
+            raise ValueError("a rate coefficient is infinite")
+        let pseudo_time_step = STEADY_STATE_STIFFNESS / largest_coefficient
+        mut settled: list[float] = quantities
+        for iteration in range(STEADY_STATE_MAX_ITERATIONS):
+            let stepped = self.implicit_step(settled, coefficients, pseudo_time_step)
+            let change = largest_change(settled, stepped)
+            settled = stepped
+            if change <= tolerance:
+                return (settled, iteration + 1)
+        raise RuntimeError("the quantities did not reach a steady state in " + str(STEADY_STATE_MAX_ITERATIONS) + " iterations")
+
+    # relaxed_toward — 各吸着種を、定常状態へ向けて time_step だけ指数的に緩和させる（ほかの化学種は変えない）
+    #   quantities: 今の番号ごとの量
+    #   steady: 同じ速度定数での定常状態の番号ごとの量（steady_state の戻り値）
+    #   coefficients: rate_coefficients の戻り値
+    #   time_step: 緩和させる時間 Δt [s]
+    #   戻り値: q_i ← q_ss,i + (q_i - q_ss,i) exp(-λ_i Δt) を各吸着種に当てた番号ごとの量（λ_i は relaxation_rate）
+    # 例: let relaxed = network.relaxed_toward(quantities, steady, coefficients, 0.0001)
+    fn relaxed_toward(let self, let quantities: list[float], let steady: list[float], let coefficients: list[list[float]], let time_step: float) -> list[float]:
+        let derivatives = self.time_derivatives(quantities, coefficients)
+        mut relaxed: list[float] = quantities
+        for position in self.adsorbate_positions:
+            let rate = self.relaxation_rate(position, quantities, steady, derivatives, coefficients)
+            relaxed[position] = steady[position] + (quantities[position] - steady[position]) * exp(-rate * time_step)
+        return relaxed
+
+    # relaxation_rate — 化学種 position の指数的な緩和の速さ λ [1/s] を見積もる
+    #   position: 化学種の番号
+    #   quantities, steady: 今の量・定常状態の量（番号ごと）
+    #   derivatives: time_derivatives(quantities, coefficients) の戻り値
+    #   coefficients: rate_coefficients の戻り値
+    #   戻り値: 割線 λ = -(d q / d t) / (q - q_ss)（d q / d t = -λ (q - q_ss) を今の点で満たす値。総和を保つ線形な系では
+    #           厳密な緩和の速さと一致する）。定常状態との差が RELAXATION_GAP_FLOOR 以下か、割線が正でなければ、
+    #           Jacobian の対角 -∂(dq/dt)/∂q（負なら 0）
+    # 例: network.relaxation_rate(1, quantities, steady, derivatives, coefficients)
+    fn relaxation_rate(let self, let position: int, let quantities: list[float], let steady: list[float], let derivatives: list[float], let coefficients: list[list[float]]) -> float:
+        let gap = quantities[position] - steady[position]
+        if abs(gap) > RELAXATION_GAP_FLOOR:
+            let secant_rate = -derivatives[position] / gap
+            if secant_rate > 0.0:
+                return secant_rate
+        return max(-self.jacobian_entry(position, position, quantities, coefficients), 0.0)
+
+    # normalized_adsorbates — 吸着種の総和を ADSORBATE_TOTAL に合わせる（量が最も大きい吸着種で差を引き受ける）
+    #   quantities: 番号ごとの量
+    #   戻り値: 合わせた後の番号ごとの量（吸着種が無ければそのまま）
+    # 例: network.normalized_adsorbates([0.5, 0.6, 1.0, 1.0])   # [0.5, 0.5, 1.0, 1.0]（番号 0 と 1 が吸着種のとき）
+    fn normalized_adsorbates(let self, let quantities: list[float]) -> list[float]:
+        if len(self.adsorbate_positions) == 0:
+            return quantities
+        mut total = 0.0
+        mut largest_position = self.adsorbate_positions[0]
+        for position in self.adsorbate_positions:
+            total += quantities[position]
+            if quantities[position] > quantities[largest_position]:
+                largest_position = position
+        mut normalized: list[float] = quantities
+        normalized[largest_position] += ADSORBATE_TOTAL - total
+        return normalized
+
+    # relax — 電位の並びに沿って緩和の計算を進め、最後の量を化学種へ書き戻す（main.ar が 1 フレームに 1 回呼ぶ）
+    #   species_list: 作ったときと同じ並びの化学種。⚠ 量が書き換わる
+    #   potentials: サブステップごとの電位 [V]（waveform.sine_potentials の戻り値など）
+    #   time_step: 1 サブステップの時間 Δt [s]（0 以上・有限。そうでなければ ValueError）
+    #   各電位 E_k について: ① E_k での定常状態を求める（前のサブステップの定常状態から始める）
+    #   ② 各吸着種をその定常状態へ Δt だけ指数的に緩和させる ③ 吸着種の総和を ADSORBATE_TOTAL に合わせる
+    # 例: network.relax(species_pool, [-0.1, -0.1001], 0.0001)
+    fn relax(let self, mut species_list: list[cg.Species], let potentials: list[float], let time_step: float) -> None:
+        check_time_step(time_step)
+        mut quantities = self.read_quantities(species_list)
+        mut steady: list[float] = quantities
+        for potential_value in potentials:
+            let coefficients = self.rate_coefficients(env.Potential(potential_value))
+            steady = self.steady_state(steady, coefficients, RELAXATION_STEADY_STATE_TOLERANCE)[0]
+            quantities = self.relaxed_toward(quantities, steady, coefficients, time_step)
+            quantities = self.normalized_adsorbates(quantities)
+        self.write_quantities(species_list, quantities)
+
+
+# ---- 化学種の並びに直接かける操作 ----
+
+# advance — 反応による化学種の量の変化を time_step だけ進める（線形陰的オイラー法の 1 歩）
+#   species_list: 化学種の並び（名前は重複しないこと）。⚠ 量が書き換わる
+#   reactions: 反応の並び（反応に出てくる化学種は species_list に無ければならない）
+#   potential: 電極の電位（main.ar が決めた値）
+#   time_step: 進める時間 h [s]（0 以上・有限）
+#   量が一定の化学種（is_quantity_fixed）は変えない。名前の重複・species_list に無い化学種・おかしな time_step は ValueError
+# 例: advance(species_pool, [volmer, heyrovsky], electrode_potential, 0.01)
+fn advance(mut species_list: list[cg.Species], let reactions: list[cg.Reaction], let potential: env.Potential, let time_step: float) -> None:
+    check_time_step(time_step)
+    let network = ReactionNetwork(species_list, reactions)
+    let quantities = network.read_quantities(species_list)
+    network.write_quantities(species_list, network.implicit_step(quantities, network.rate_coefficients(potential), time_step))
+
+# settle_to_steady_state — 電位 potential での定常状態（d q / d t = 0）まで化学種の量を動かす（緩和の時間は扱わない）
+#   species_list: 化学種の並び（advance と同じ）。⚠ 量が書き換わる
+#   reactions: 反応の並び
+#   potential: 電極の電位
+#   戻り値: implicit_step を呼んだ回数（速度定数がすべて 0 なら 0 で、量は変えない）
+#   電位が極端で速度定数の exp があふれると OverflowError（butler_volmer_k の exp が投げる）、速度定数が無限大なら ValueError、
+#   STEADY_STATE_MAX_ITERATIONS 回で収束しなければ RuntimeError
+# 例: settle_to_steady_state(species_pool, [volmer, heyrovsky], env.Potential(-0.1))
+fn settle_to_steady_state(mut species_list: list[cg.Species], let reactions: list[cg.Reaction], let potential: env.Potential) -> int:
+    let network = ReactionNetwork(species_list, reactions)
+    let result = network.steady_state(network.read_quantities(species_list), network.rate_coefficients(potential), STEADY_STATE_TOLERANCE)
+    network.write_quantities(species_list, result[0])
+    return result[1]

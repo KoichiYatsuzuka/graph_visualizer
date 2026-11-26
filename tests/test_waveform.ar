@@ -1,0 +1,44 @@
+# test_waveform.ar — waveform.py（1 フレーム分の sin 波の電位をまとめて計算する Python の関数）の自動テスト
+#
+# 実行: arrow tests/test_waveform.ar（tests/run_tests.ps1 が tests/test_*.ar をまとめて走らせる）。窓は開かない。
+#
+# 見ること: 点の数・位相 0° / 90° / 180° / 270° の値・中心電位と振幅のかかり方・count 0 は空・負の count は ValueError
+# 期待と違えば RuntimeError を raise して非 0 で終わる。
+
+import[py] ..waveform
+
+const TOLERANCE = 1e-12
+
+# expect_true — 条件が偽なら RuntimeError を投げ、真なら OK を表示する
+#   condition: 確かめる条件
+#   label:     表示とエラーメッセージに出す説明
+# 例: expect_true(1 == 1, "one is one")
+fn expect_true(let condition: bool, let label: str) -> None:
+    if not condition:
+        raise RuntimeError("FAILED: " + label)
+    print("OK:", label)
+
+# check_sine_potentials — sine_potentials の値を確かめる
+# 例: check_sine_potentials()
+fn check_sine_potentials() -> None:
+    mut potentials: list[float] = waveform.sine_potentials(-0.1, 0.02, 0.0, 0.25, 4) => list[float]
+    expect_true(len(potentials) == 4, "sine_potentials returns count points")
+    expect_true(abs(potentials[0] - (-0.1)) <= TOLERANCE, "phase 0 deg is the center potential: " + str(potentials[0]))
+    expect_true(abs(potentials[1] - (-0.08)) <= TOLERANCE, "phase 90 deg is center + amplitude: " + str(potentials[1]))
+    expect_true(abs(potentials[2] - (-0.1)) <= TOLERANCE, "phase 180 deg is the center again: " + str(potentials[2]))
+    expect_true(abs(potentials[3] - (-0.12)) <= TOLERANCE, "phase 270 deg is center - amplitude: " + str(potentials[3]))
+    mut substeps: list[float] = waveform.sine_potentials(0.0, 0.01, 0.5, 0.1 / 360.0, 60) => list[float]
+    expect_true(len(substeps) == 60 and abs(substeps[0]) <= TOLERANCE, "60 substeps of 0.1 deg starting at 180 deg")
+    expect_true(substeps[59] < 0.0, "after 180 deg the potential goes below the center")
+    mut empty: list[float] = waveform.sine_potentials(0.0, 0.01, 0.0, 0.1, 0) => list[float]
+    expect_true(len(empty) == 0, "count 0 gives an empty list")
+    mut raised_value_error = False
+    try:
+        mut _ = waveform.sine_potentials(0.0, 0.01, 0.0, 0.1, -1)
+    except ValueError:
+        raised_value_error = True
+    expect_true(raised_value_error, "a negative count is ValueError")
+
+
+check_sine_potentials()
+print("all waveform checks passed")

@@ -5,13 +5,19 @@ import environment as env
 import[cpp-dll] raylib_bridge.raylib_bridge as rl
 import raylib_bridge.raylib_consts as rlc
 import chemical_graphs as cg
+import kinetics as kn
 import slider_panel as sp
+import[py] math
+import[py] waveform     # このディレクトリの waveform.py（1 フレーム分の sin 波の電位をまとめて計算する）
 
-# 化学種。pos は窓の大きさに対する割合（(0, 0) が左上、(1, 1) が右下）、color は円の塗りの色。
-# 円の半径は quantity で決まる（1 で 100 px、1/10 ごとに半分、下限 10 px）
+# 化学種の初期状態。pos は窓の大きさに対する割合（(0, 0) が左上、(1, 1) が右下）、color は円の塗りの色。
+# 円の半径は quantity で決まる（1 で 100 px、1/10 ごとに半分、下限 10 px）。
+# ⚠ 実行中の量は species_pool（下）が持つ。これらの変数は初期状態と、反応式で化学種を名前で指すためだけに使う
+#   （Arrow では list やフィールドに入れると写しになるので、量を 1 か所にまとめている。let にすると写しも不変になり、
+#    kn が量を書き換えられない）
 mut vacancy = cg.Adsorbate(
     name = "vacancy",
-    pos = cg.Position(0.1, 0.85),
+    pos = cg.Position(0.5, 0.85),
     quantity = 0.0,
     color = rl.Color(130, 130, 130, 255)
 )
@@ -19,14 +25,14 @@ mut vacancy = cg.Adsorbate(
 
 mut H_ads = cg.Adsorbate(
     name = "H_ads",
-    pos = cg.Position(0.35, 0.78),
+    pos = cg.Position(0.5, 0.17),
     quantity = 1.0,
     color = rl.Color(230, 41, 55, 255)
 )
 
 mut H2_gas = cg.Solute(
     name = "H2",
-    pos = cg.Position(0.82, 0.25),
+    pos = cg.Position(0.88, 0.5),
     quantity = 1.0,
     color = rl.Color(0, 121, 241, 255),
     is_const = True
@@ -34,44 +40,150 @@ mut H2_gas = cg.Solute(
 
 mut proton = cg.Solute(
     name = "H+",
-    pos = cg.Position(0.82, 0.72),
+    pos = cg.Position(0.5, 0.5),
     quantity = 1.0,
     color = rl.Color(255, 161, 0, 255),
     is_const = True
 )
 
-# 矢印の形（スライダーの窓 controls から書き換える）
-mut arrow_curvature = 0.005     # 矢印の曲率 [1/pixel]（0 で直線・正なら進む向きに見て左へ曲がる）
-mut arrow_thickness = 6.0       # 矢印の軸の太さ [pixel]
+# 描く順（後ろほど手前）に並べた化学種。反応で量が変わるのはこの中の値（毎フレーム reaction_network.relax が書き換える）
+mut species_pool: list[cg.Species] = [vacancy, H_ads, H2_gas, proton]
 
-# クリックで選ばれた化学種の番号（species_in_draw_order() の並びでの位置）。None なら何も選ばれていない
+# 素反応の Butler-Volmer 関係式のパラメータ（⚠ 動きを見るための仮の値。文献値・実測値ではない）
+const VOLMER_CENTER_POTENTIAL = -0.1        # Volmer 反応の平衡電位 [V]
+const VOLMER_K0 = 1.0                       # Volmer 反応の平衡電位での速度定数 [1/s]
+const HEYROVSKY_CENTER_POTENTIAL = 0.1      # Heyrovsky 反応の平衡電位 [V]
+const HEYROVSKY_K0 = 0.1                    # Heyrovsky 反応の平衡電位での速度定数 [1/s]
+const ELECTRON_TRANSFER_COEFFICIENT = 0.5   # 電荷移動係数 α（両反応で共通）
+
+# Volmer 反応: H+ + e- + * → H_ads（正反応 = 還元）
+let volmer_rate_coefficients = kn.butler_volmer_k_pair(VOLMER_CENTER_POTENTIAL, VOLMER_K0, ELECTRON_TRANSFER_COEFFICIENT)
+let volmer = cg.Reaction(
+    [cg.Stoichiometry(proton, 1), cg.Stoichiometry(vacancy, 1)],
+    [cg.Stoichiometry(H_ads, 1)],
+    volmer_rate_coefficients[0],
+    volmer_rate_coefficients[1],
+    cg.Position(0.3, 0.5)                   # 反応の中心（矢印がここを通る）
+)
+
+# Heyrovsky 反応: H_ads + H+ + e- → H2 + *（正反応 = 還元）
+let heyrovsky_rate_coefficients = kn.butler_volmer_k_pair(HEYROVSKY_CENTER_POTENTIAL, HEYROVSKY_K0, ELECTRON_TRANSFER_COEFFICIENT)
+let heyrovsky = cg.Reaction(
+    [cg.Stoichiometry(H_ads, 1), cg.Stoichiometry(proton, 1)],
+    [cg.Stoichiometry(H2_gas, 1), cg.Stoichiometry(vacancy, 1)],
+    heyrovsky_rate_coefficients[0],
+    heyrovsky_rate_coefficients[1],
+    cg.Position(0.7, 0.5)
+)
+
+let reactions: list[cg.Reaction] = [volmer, heyrovsky]
+let reaction_network = kn.ReactionNetwork(species_pool, reactions)   # 化学種と反応を番号で引く計算用の表（species_pool と同じ並び）
+
+# ---- 電位の時間変化 ----
+# 電極の電位 = center_potential + potential_amplitude * sin(2π × phase_cycles)
+# 時間は画面の DISPLAY_SECONDS_PER_PERIOD 秒で 1 周期進む（time_scale の周波数によらず、見える速さは一定）。
+# シミュレーションの時間は time_scale の周期で決まり、位相は 周波数 × シミュレーションの時間 で進む。
+# 1 フレーム（60 FPS で位相 6°）を SUBSTEPS_PER_FRAME 個のサブステップ（0.1°）に分け、サブステップごとに
+# 吸着種をその電位の定常状態へ指数的に緩和させる（reaction_network.relax）。描くのはフレームの終わりの量。
+const DISPLAY_SECONDS_PER_PERIOD = 1.0      # 画面の何秒で 1 周期を見せるか [s]（固定。time_scale の値に寄与しない）
+const SUBSTEPS_PER_FRAME = 60               # 1 フレームのサブステップの数
+const INITIAL_FREQUENCY = 10.0              # 周波数の初期値 [Hz]
+const INITIAL_AMPLITUDE_MV = 10.0           # sin 波の振幅の初期値 [mV]（スライダーは 0〜100 mV）
+
+mut time_scale = env.TimeScale(env.Frequency(INITIAL_FREQUENCY))   # 周波数と周期（スライダーの窓 controls から書き換える）
+mut center_potential = env.Potential(0.0)              # sin 波の中心電位 [V]（スライダーの窓 controls から書き換える）
+mut potential_amplitude = INITIAL_AMPLITUDE_MV / 1000.0 # sin 波の振幅 [V]（スライダーの窓 controls から書き換える）
+mut simulated_seconds = 0.0                            # シミュレーションの経過時間 [s]（frame_step が進める）
+mut phase_cycles = 0.0                                 # sin 波の位相 [周期]（frame_step が 周波数 × シミュレーションの時間刻み だけ進める）
+mut electrode_potential = env.Potential(0.0)           # このフレームの最後のサブステップの電位（表示用。frame_step が決める）
+
+# 反応の矢印のグラデーションの位相 [周期]（reactions と同じ並び。advance_reaction_flows が 速さ × 画面の経過時間 だけ進める）
+mut reaction_flow_phases: list[float] = [0.0] * len(reactions)
+
+# クリックで選ばれた化学種の番号（species_pool の並びでの位置）。None なら何も選ばれていない
 mut selected_species_index: Option[int] = None
 
-# set_arrow_curvature — 曲率のスライダーが動いたときに controls.apply_changes() から呼ばれ、arrow_curvature を書き換える
-#   value: スライダーの新しい値 [1/pixel]
-# 例: set_arrow_curvature(0.002)
-fn set_arrow_curvature(let value: float) -> None:
-    arrow_curvature = value
+# set_center_potential — 中心電位のスライダーが動いたときに controls.apply_changes() から呼ばれ、center_potential を書き換える
+#   value: スライダーの新しい値 [V]
+# 例: set_center_potential(-0.2)
+fn set_center_potential(let value: float) -> None:
+    center_potential = env.Potential(value)
 
-# set_arrow_thickness — 太さのスライダーが動いたときに controls.apply_changes() から呼ばれ、arrow_thickness を書き換える
-#   value: スライダーの新しい値 [pixel]
-# 例: set_arrow_thickness(8.0)
-fn set_arrow_thickness(let value: float) -> None:
-    arrow_thickness = value
+# set_potential_amplitude_mv — 振幅のスライダーが動いたときに controls.apply_changes() から呼ばれ、potential_amplitude を書き換える
+#   value: スライダーの新しい値 [mV]
+# 例: set_potential_amplitude_mv(25.0)   # potential_amplitude は 0.025 V
+fn set_potential_amplitude_mv(let value: float) -> None:
+    potential_amplitude = value / 1000.0
 
+# set_log10_frequency — 周波数のスライダー（log10 の目盛り）が動いたときに controls.apply_changes() から呼ばれ、time_scale の周波数を変える
+#   value: log10(周波数 / Hz)（-2 で 0.01 Hz、5 で 100 kHz）
+# 例: set_log10_frequency(3.0)   # 1 kHz（周期 1 ms）
+fn set_log10_frequency(let value: float) -> None:
+    time_scale.set_applied_frequency(env.Frequency(10.0 ** value))
 
-# species_in_draw_order — 描く順（後ろほど手前）に並べた化学種を返す。クリックの判定と描画に同じ並びを使う
-#   戻り値: [vacancy, H_ads, H2_gas, proton] の今の値の写し（毎フレーム呼ぶので、大域変数の quantity などの変更は次のフレームに反映される）
-# 例: let drawn_species = species_in_draw_order()
-fn species_in_draw_order() -> list[cg.Species]:
-    let drawn_species: list[cg.Species] = [vacancy, H_ads, H2_gas, proton]
-    return drawn_species
+# frame_step — 画面の経過時間 display_seconds だけ時間を進め、その間の緩和を SUBSTEPS_PER_FRAME 個のサブステップで計算する
+#   display_seconds: 前のフレームからの画面の経過時間 [s]（rl.get_frame_time()。60 FPS なら位相 6°、1 サブステップ 0.1°）
+#   ① サブステップごとの電位を Python（waveform.sine_potentials）に 1 回でまとめて計算させる（位相はサブステップの初め）
+#   ② reaction_network.relax で、各電位の定常状態への指数的な緩和と吸着種の総和の調整を順に行い、species_pool に書き戻す
+#   simulated_seconds・phase_cycles・electrode_potential・species_pool を書き換える
+# 例: frame_step(rl.get_frame_time())
+fn frame_step(let display_seconds: float) -> None:
+    let substep_seconds = time_scale.simulated_time_step(display_seconds / SUBSTEPS_PER_FRAME, DISPLAY_SECONDS_PER_PERIOD) => float
+    let phase_step_cycles = (time_scale.get_applied_frequency() => float) * substep_seconds
+    mut substep_potentials: list[float] = waveform.sine_potentials(center_potential => float, potential_amplitude, phase_cycles, phase_step_cycles, SUBSTEPS_PER_FRAME) => list[float]
+    reaction_network.relax(species_pool, substep_potentials, substep_seconds)
+    simulated_seconds += substep_seconds * SUBSTEPS_PER_FRAME
+    phase_cycles = (phase_cycles + phase_step_cycles * SUBSTEPS_PER_FRAME) % 1.0
+    electrode_potential = env.Potential(substep_potentials[SUBSTEPS_PER_FRAME - 1])
+
+# runs_backward — 今の電位・量で、逆反応の速さが正反応の速さより大きいか（矢印の向きを決める。等しければ正反応の向き）
+#   reaction: 反応
+#   quantities: {名前: 量}（kn.quantities_by_name(species_pool)）
+#   戻り値: k_b Π_生成物 q^ν > k_f Π_基質 q^ν なら True
+# 例: runs_backward(volmer, kn.quantities_by_name(species_pool))
+fn runs_backward(let reaction: cg.Reaction, let quantities: dict[str, float]) -> bool:
+    return kn.backward_reaction_rate(reaction, quantities, electrode_potential) > kn.forward_reaction_rate(reaction, quantities, electrode_potential)
+
+# advance_reaction_flows — 反応の矢印のグラデーションの位相を、画面の経過時間 display_seconds だけ進める
+#   display_seconds: 前のフレームからの画面の経過時間 [s]
+#   速さは今の電位での、速いほうの向き（runs_backward）の速度定数で決まる（cg.reaction_flow_speed: 0.5〜4.5 周期/秒）。
+#   reaction_flow_phases を書き換える
+# 例: advance_reaction_flows(rl.get_frame_time())
+fn advance_reaction_flows(let display_seconds: float) -> None:
+    let quantities = kn.quantities_by_name(species_pool)
+    for reaction_index in range(len(reactions)):
+        mut rate_constant = reactions[reaction_index].forward_rate_coefficient(electrode_potential)
+        if runs_backward(reactions[reaction_index], quantities):
+            rate_constant = reactions[reaction_index].backward_rate_coefficient(electrode_potential)
+        reaction_flow_phases[reaction_index] = (reaction_flow_phases[reaction_index] + cg.reaction_flow_speed(rate_constant) * display_seconds) % 1.0
+
+# draw_reactions — 反応を矢印で描く（速いほうの向きに、出発側 → 中心 → 行き先。begin_drawing と end_drawing の間、化学種の円より先に呼ぶ）
+#   screen_width, screen_height: 窓の幅・高さ [pixel]
+#   太さは今の電位・量での、速いほうの向きの反応の速さ（速度定数 × 出発側の量の積。cg.reaction_arrow_thickness: 5〜20 px）
+# 例: draw_reactions(rl.get_screen_width(), rl.get_screen_height())
+fn draw_reactions(let screen_width: int, let screen_height: int) -> None:
+    let quantities = kn.quantities_by_name(species_pool)
+    for reaction_index in range(len(reactions)):
+        let reaction = reactions[reaction_index]
+        let forward_rate = kn.forward_reaction_rate(reaction, quantities, electrode_potential)
+        let backward_rate = kn.backward_reaction_rate(reaction, quantities, electrode_potential)
+        reaction.draw(species_pool, max(forward_rate, backward_rate), reaction_flow_phases[reaction_index], runs_backward(reaction, quantities), screen_width, screen_height)
+
+# draw_status — 窓の左上（題名の下）に、電位と、周波数・シミュレーションの時間を 2 行で描く（begin_drawing と end_drawing の間で呼ぶ）
+#   （上の真ん中の H_ads の円に重ならないよう、1 行を短くしている）
+# 例: draw_status()
+fn draw_status() -> None:
+    let potential_line = "E = " + format(electrode_potential => float, "+.4f") + " V (center " + format(center_potential => float, "+.3f") + " V, amplitude " + format(potential_amplitude * 1000.0, ".0f") + " mV)"
+    let time_line = "f = " + format(time_scale.get_applied_frequency() => float, ".3g") + " Hz   t = " + format(simulated_seconds, ".4g") + " s"
+    rl.draw_text(potential_line.encode("utf-8"), 20, 52, 16, rl.Color(40, 40, 40, 255))
+    rl.draw_text(time_line.encode("utf-8"), 20, 72, 16, rl.Color(40, 40, 40, 255))
+
 
 # update_selection — 左ボタンが押されたフレームなら、クリックされた化学種の番号を selected_species_index に入れる
 #   （重なった円では最も手前のもの。どれにも重ならなければ None にして選択を外す）
-#   drawn_species: species_in_draw_order() の戻り値（このフレームで描く並び）
+#   drawn_species: このフレームで描く化学種の並び（species_pool）
 #   screen_width, screen_height: 窓の幅・高さ [pixel]
-# 例: update_selection(species_in_draw_order(), rl.get_screen_width(), rl.get_screen_height())
+# 例: update_selection(species_pool, rl.get_screen_width(), rl.get_screen_height())
 fn update_selection(let drawn_species: list[cg.Species], let screen_width: int, let screen_height: int) -> None:
     if rl.is_mouse_button_pressed(rlc.MOUSE_BUTTON_LEFT):
         let mouse = rl.get_mouse_position() mustbe rl.Vector2
@@ -79,33 +191,29 @@ fn update_selection(let drawn_species: list[cg.Species], let screen_width: int, 
 
 
 rl.set_config_flags(rlc.FLAG_MSAA_4X_HINT)
-rl.init_window(800, 600, "graph_visualizer".encode("utf-8"))
+rl.init_window(1100, 700, "graph_visualizer".encode("utf-8"))
 rl.set_target_fps(60)
 
 mut controls = sp.SliderWindow("graph_visualizer controls")
-controls.add_slider("curvature [1/px]", -0.01, 0.01, arrow_curvature, set_arrow_curvature)
-controls.add_slider("thickness [px]", 1.0, 20.0, arrow_thickness, set_arrow_thickness, 190)
+controls.add_slider("center potential [V]", -0.3, 0.3, center_potential => float, set_center_potential, 600)
+controls.add_slider("amplitude [mV]", 0.0, 100.0, INITIAL_AMPLITUDE_MV, set_potential_amplitude_mv, 100)
+controls.add_slider("log10(frequency / Hz)", -2.0, 5.0, math.log10(INITIAL_FREQUENCY), set_log10_frequency, 700)
 
 mut running = True
 
 while running:
-    controls.apply_changes()        # 前のフレームから動いたスライダーの分だけ set_arrow_* が呼ばれる
+    controls.apply_changes()        # 前のフレームから動いたスライダーの分だけ set_* が呼ばれる
+    frame_step(rl.get_frame_time())  # 時間を 1 フレーム進め、サブステップごとの緩和を計算して species_pool に書き戻す
+    advance_reaction_flows(rl.get_frame_time())
     let screen_width = rl.get_screen_width()
     let screen_height = rl.get_screen_height()
-    let drawn_species = species_in_draw_order()
-    update_selection(drawn_species, screen_width, screen_height)
+    update_selection(species_pool, screen_width, screen_height)
     rl.begin_drawing()
     rl.clear_background(cg.CANVAS_BACKGROUND_COLOR)
     rl.draw_text("graph_visualizer".encode("utf-8"), 20, 20, 24, rl.Color(40, 40, 40, 255))
-    cg.draw_species_list(drawn_species, selected_species_index, screen_width, screen_height)
-    #rl.draw_curved_arrow(180.0, 120.0, 380.0, 320.0, 6.0, rl.Color(200, 20, 20, 255), rl.Color(20, 20, 200, 255), 0.005)
-    rl.draw_curved_arrow_flowing(180.0, 120.0, 380.0, 320.0, arrow_thickness,
-        rl.Color(255, 200, 200, 255),   # start_color：始点（淡い色）
-        rl.Color(230, 41, 55, 255),     # middle_color：軸の長さのちょうど半分
-        rl.Color(90, 0, 20, 255),       # end_color：矢じりの付け根。矢じりもこの色
-        arrow_curvature,
-        rl.get_time()/6
-    )
+    draw_status()
+    draw_reactions(screen_width, screen_height)     # 矢印を先に描き、化学種の円と文字を上に重ねる
+    cg.draw_species_list(species_pool, selected_species_index, screen_width, screen_height)
     rl.end_drawing()
     running = not rl.window_should_close()
 

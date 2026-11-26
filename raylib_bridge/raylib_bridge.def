@@ -34,4 +34,6 @@ EXPORTS
     draw_curved_arrow
     draw_curved_arrow_three_colors
     draw_curved_arrow_flowing
+    draw_curved_line_flowing
     read_screen_pixel
+    save_screen_image

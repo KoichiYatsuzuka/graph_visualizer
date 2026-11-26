@@ -137,6 +137,12 @@ void draw_curved_arrow_three_colors(float start_x, float start_y, float end_x, f
 //   also when flow_phase is NaN or infinite.
 void draw_curved_arrow_flowing(float start_x, float start_y, float end_x, float end_y, float thickness, Color start_color, Color middle_color, Color end_color, float curvature, double flow_phase);
 
+// draw_curved_line_flowing: draw_curved_arrow_flowing without the head; the shaft runs all the way to the end point
+//   and its colors flow toward the end point. Use it for the part of an edge that should not point at anything
+//   (e.g. from a reactant to the centre of a reaction). The arguments and the inputs that draw nothing are the
+//   same as draw_curved_arrow_flowing.
+void draw_curved_line_flowing(float start_x, float start_y, float end_x, float end_y, float thickness, Color start_color, Color middle_color, Color end_color, float curvature, double flow_phase);
+
 // -- bridge-only helpers (not in raylib) -----------------------------------------
 // read_screen_pixel: color of the pixel (x, y) drawn so far in the current frame.
 //   Call it between begin_drawing and end_drawing. (0, 0) is the top-left corner; the
@@ -144,6 +150,13 @@ void draw_curved_arrow_flowing(float start_x, float start_y, float end_x, float 
 //   Returns Color(0, 0, 0, 0) when (x, y) is outside the window. It reads the whole
 //   framebuffer, so use it in tests, not every frame.
 Color read_screen_pixel(int x, int y);
+
+// save_screen_image: save what has been drawn so far in the current frame to an image file.
+//   Call it between begin_drawing and end_drawing (it works with a hidden window too, so a scene can be
+//   checked by eye without showing a window). The extension decides the format (".png").
+//   file_name: path of the file to write; an existing file is overwritten.
+//   Returns true when the file was written.
+bool save_screen_image(const char* file_name);
 
 #ifdef __cplusplus
 }

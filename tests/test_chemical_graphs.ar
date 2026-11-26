@@ -12,6 +12,9 @@
 #      印は円の上、窓の上にはみ出すなら円の下
 #   5. 描画（非表示の窓で画素を読み戻す）: 円の色・名前と量の文字・クリックされた印（印を付けた化学種にだけ・None なら無し）、
 #      範囲外の番号は IndexError
+#   6. 反応の矢印: 速度定数 → 流れる速さ（0.5〜4.5 周期/秒）・反応速度 → 太さ（5〜20 px）が log10 で 1e-2〜1e6 の間だけ変わる、
+#      円の縁の点、基質 → 中心は矢じりなし・中心 → 生成物は矢じりあり・緩やかに曲がる・中心の点、反応の化学種が無ければ ValueError、
+#      is_backward なら向きが逆（生成物 → 中心 → 基質。矢じりは基質の手前）
 # 期待と違えば RuntimeError を raise して非 0 で終わる。
 
 # ⚠ rl は cg より先に import する。raylib_bridge を import するモジュール（cg）を先に import すると、このファイルで構造体を
@@ -19,6 +22,7 @@
 import[cpp-dll] ..raylib_bridge.raylib_bridge as rl
 import ..raylib_bridge.raylib_consts as rlc
 import ..chemical_graphs as cg
+import ..environment as env
 
 const WINDOW_WIDTH = 800
 const WINDOW_HEIGHT = 600
@@ -37,6 +41,14 @@ const SCENE_NAME_ROW = 291            # 名前の行の中ほどの y（上端 3
 const SCENE_BLUE_MARK_ROW = 186       # 青い円の印の行の中ほどの y（上端 300 - 100 - 4 - 20 = 176 に 20 // 2 を足す）
 const SCENE_ORANGE_MARK_ROW = 261     # 橙の円に印を描いたときの行の中ほどの y（上端 300 - 25 - 4 - 20 = 251 に 10 を足す）
 const SCENE_VACANCY_NAME_ROW = 81     # vacancy の名前の行の中ほどの y（上端 90 - 19 = 71 に 10 を足す）
+
+# constant_rate_coefficient — 反応を作るための仮の速度定数の関数（描画のテストでは速度定数を使わない）
+#   reaction: 反応（使わない）
+#   potential: 電位（使わない）
+#   戻り値: 1.0
+# 例: cg.Fn_RateCoefficient(constant_rate_coefficient)
+fn constant_rate_coefficient(let reaction: cg.Reaction, let potential: env.Potential) -> float:
+    return 1.0
 
 # expect_true — 条件が偽なら RuntimeError を投げ、真なら OK を表示する
 #   condition: 確かめる条件
@@ -227,10 +239,109 @@ fn check_index_out_of_range() -> None:
     expect_true(raised_index_error, "draw_species_list with highlighted_index out of range is IndexError")
 
 
+# check_arrow_scaling — 6. 速さ・太さの写し方と、円の縁の点
+# 例: check_arrow_scaling()
+fn check_arrow_scaling() -> None:
+    expect_close(cg.reaction_flow_speed(1.0e-3), 0.5, RADIUS_TOLERANCE, "flow speed below 1e-2 stays at 0.5 cycles/s")
+    expect_close(cg.reaction_flow_speed(1.0e-2), 0.5, RADIUS_TOLERANCE, "flow speed at 1e-2 is 0.5")
+    expect_close(cg.reaction_flow_speed(1.0e2), 2.5, RADIUS_TOLERANCE, "flow speed at 1e2 (middle of the log range) is 2.5")
+    expect_close(cg.reaction_flow_speed(1.0e6), 4.5, RADIUS_TOLERANCE, "flow speed at 1e6 is 4.5")
+    expect_close(cg.reaction_flow_speed(1.0e9), 4.5, RADIUS_TOLERANCE, "flow speed above 1e6 stays at 4.5")
+    expect_close(cg.reaction_arrow_thickness(0.0), 5.0, RADIUS_TOLERANCE, "thickness for rate 0 is the minimum 5 px")
+    expect_close(cg.reaction_arrow_thickness(1.0e2), 12.5, RADIUS_TOLERANCE, "thickness at rate 1e2 is 12.5 px")
+    expect_close(cg.reaction_arrow_thickness(1.0e4), 16.25, RADIUS_TOLERANCE, "thickness at rate 1e4 is 16.25 px")
+    expect_close(cg.reaction_arrow_thickness(1.0e12), 20.0, RADIUS_TOLERANCE, "thickness above 1e6 stays at 20 px")
+    mut raised_value_error = False
+    try:
+        let _ = cg.reaction_arrow_thickness(float("nan"))
+    except ValueError:
+        raised_value_error = True
+    expect_true(raised_value_error, "a NaN rate is ValueError")
+    let edge = cg.edge_point_toward(rl.Vector2(100.0, 100.0), 50.0, rl.Vector2(100.0, 300.0))
+    expect_true(edge.x == 100.0 and edge.y == 150.0, "edge_point_toward goes radius toward the target")
+    let same = cg.edge_point_toward(rl.Vector2(100.0, 100.0), 50.0, rl.Vector2(100.0, 100.0))
+    expect_true(same.x == 100.0 and same.y == 100.0, "edge_point_toward returns the center when the target is the center")
+
+# ---- 反応の矢印の描画の確認に使う場面（窓 800 x 600）----
+# 基質 "A"（中心 (160, 300)・半径 12.5）→ 反応の中心 (400, 300) → 生成物 "B"（中心 (640, 300)・半径 12.5）、反応速度 1e2（太さ 12.5）
+#   基質 → 中心: (172.5, 300) → (400, 300)。曲率 0.5 / 227.5 で、右向きに進んで左へ曲がるので弧は下へ約 14 px 膨らむ（頂点 x = 286）
+#   中心 → 生成物: (400, 300) → (627.5, 300)。同じく下へ膨らみ、矢じり（長さ・幅 50）は x = 577.5〜627.5
+
+# reaction_scene_species — 反応の矢印の場面の化学種（A・B とも量 0.001 で半径 12.5）
+#   戻り値: [A, B]
+# 例: reaction_scene_species()
+fn reaction_scene_species() -> list[cg.Species]:
+    let substrate = cg.Adsorbate(name = "A", pos = cg.Position(0.2, 0.5), quantity = 0.001, color = BLUE_COLOR)
+    let product = cg.Adsorbate(name = "B", pos = cg.Position(0.8, 0.5), quantity = 0.001, color = ORANGE_COLOR)
+    let scene: list[cg.Species] = [substrate, product]
+    return scene
+
+# make_scene_reaction — 反応の矢印の場面の反応 A → B（中心は窓の中央）
+#   戻り値: Reaction
+# 例: make_scene_reaction().draw(reaction_scene_species(), 100.0, 0.0, False, WINDOW_WIDTH, WINDOW_HEIGHT)
+fn make_scene_reaction() -> cg.Reaction:
+    let rate_coefficient = cg.Fn_RateCoefficient(constant_rate_coefficient)
+    let species = reaction_scene_species()
+    return cg.Reaction([cg.Stoichiometry(species[0], 1)], [cg.Stoichiometry(species[1], 1)], rate_coefficient, rate_coefficient, cg.Position(0.5, 0.5))
+
+# check_reaction_scene — 反応の矢印の画素を確かめる（make_scene_reaction を描いた直後、end_drawing の前に呼ぶ）
+# 例: check_reaction_scene()
+fn check_reaction_scene() -> None:
+    expect_pixel(400, 300, cg.REACTION_CENTER_COLOR, "the reaction center has a dot")
+    expect_true(not same_rgb(rl.read_screen_pixel(286, 314) mustbe rl.Color, BACKGROUND_COLOR), "the substrate -> center line bulges about 14 px downward (gentle arc)")
+    expect_pixel(286, 290, BACKGROUND_COLOR, "the substrate -> center line is not straight on the chord")
+    expect_true(not same_rgb(rl.read_screen_pixel(514, 314) mustbe rl.Color, BACKGROUND_COLOR), "the center -> product arrow bulges downward too")
+    expect_pixel(600, 316, cg.REACTION_ARROW_END_COLOR, "the center -> product arrow has a head (end color) near the product")
+    expect_pixel(385, 316, BACKGROUND_COLOR, "the substrate -> center line has no head at the center")
+    expect_pixel(300, 300, BACKGROUND_COLOR, "nothing is drawn between the line and the chord")
+
+# check_backward_reaction_scene — 逆向き（is_backward = True）の矢印の画素を確かめる（生成物 → 中心 → 基質）
+#   生成物 → 中心: (627.5, 300) → (400, 300)。左向きに進んで左へ曲がるので弧は上へ膨らむ。中心の側に矢じりは無い
+#   中心 → 基質: (400, 300) → (172.5, 300)。上へ膨らみ、矢じりは基質の手前 x = 172.5〜222.5
+# 例: check_backward_reaction_scene()
+fn check_backward_reaction_scene() -> None:
+    expect_pixel(200, 284, cg.REACTION_ARROW_END_COLOR, "backward: the head (end color) is near the substrate")
+    expect_pixel(600, 316, BACKGROUND_COLOR, "backward: no head near the product")
+    expect_pixel(600, 284, BACKGROUND_COLOR, "backward: no head on the product side at all")
+    expect_pixel(415, 284, BACKGROUND_COLOR, "backward: the product -> center line has no head at the center")
+    expect_true(not same_rgb(rl.read_screen_pixel(514, 286) mustbe rl.Color, BACKGROUND_COLOR), "backward: the line bulges upward")
+
+# draw_reaction_frames — 反応の矢印の場面を FRAME_COUNT フレーム描き、最後のフレームで check_reaction_scene を呼ぶ。
+#   反応の化学種が並びに無いと ValueError になることも確かめる
+# 例: draw_reaction_frames()
+fn draw_reaction_frames() -> None:
+    let reaction = make_scene_reaction()
+    mut frame_index = 0
+    while frame_index < FRAME_COUNT:
+        rl.begin_drawing()
+        rl.clear_background(BACKGROUND_COLOR)
+        reaction.draw(reaction_scene_species(), 100.0, 0.0, False, WINDOW_WIDTH, WINDOW_HEIGHT)
+        cg.draw_species_list(reaction_scene_species(), None, WINDOW_WIDTH, WINDOW_HEIGHT)
+        if frame_index == FRAME_COUNT - 1:
+            check_reaction_scene()
+        rl.end_drawing()
+        frame_index += 1
+    rl.begin_drawing()
+    rl.clear_background(BACKGROUND_COLOR)
+    reaction.draw(reaction_scene_species(), 100.0, 0.0, True, WINDOW_WIDTH, WINDOW_HEIGHT)
+    cg.draw_species_list(reaction_scene_species(), None, WINDOW_WIDTH, WINDOW_HEIGHT)
+    check_backward_reaction_scene()
+    rl.end_drawing()
+    let only_substrate: list[cg.Species] = [reaction_scene_species()[0]]
+    mut raised_value_error = False
+    rl.begin_drawing()
+    try:
+        reaction.draw(only_substrate, 100.0, 0.0, False, WINDOW_WIDTH, WINDOW_HEIGHT)
+    except ValueError:
+        raised_value_error = True
+    rl.end_drawing()
+    expect_true(raised_value_error, "drawing a reaction whose product is not in the species list is ValueError")
+
 # ---- 本体 ----
 check_radius()
 check_position()
 check_hit_test()
+check_arrow_scaling()
 
 rl.set_trace_log_level(rlc.LOG_WARNING)
 rl.set_config_flags(rlc.FLAG_WINDOW_HIDDEN)
@@ -240,5 +351,6 @@ check_label_color_and_mark_position()
 draw_scene_frames(0)
 draw_scene_frames(None)
 check_index_out_of_range()
+draw_reaction_frames()
 rl.close_window()
 print("all chemical_graphs checks passed")

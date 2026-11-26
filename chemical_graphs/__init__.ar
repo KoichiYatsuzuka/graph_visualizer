@@ -15,6 +15,22 @@ const HIGHLIGHT_MARK_TEXT = "[clicked]"     # クリックされた化学種の�
 const HIGHLIGHT_MARK_FONT_SIZE = 20         # 印の文字の大きさ [pixel]
 const HIGHLIGHT_MARK_GAP = 4                # 円の縁と印の間 [pixel]
 
+# ---- 反応を矢印で描くときの太さ・流れる速さ・形 ----
+# 速度定数・反応速度の log10 を SCALE_LOWER_VALUE〜SCALE_UPPER_VALUE の間で線形に写す（範囲の外は端の値のまま）
+const SCALE_LOWER_VALUE = 1.0e-2            # これ以下の速度定数・反応速度は最小の速さ・太さ
+const SCALE_UPPER_VALUE = 1.0e6             # これ以上の速度定数・反応速度は最大の速さ・太さ
+const MINIMUM_FLOW_CYCLES_PER_SECOND = 0.5  # グラデーションが流れる最小の速さ [周期/画面の秒]
+const MAXIMUM_FLOW_CYCLES_PER_SECOND = 4.5  # グラデーションが流れる最大の速さ [周期/画面の秒]
+const MINIMUM_ARROW_THICKNESS = 5.0         # 矢印の最小の太さ [pixel]
+const MAXIMUM_ARROW_THICKNESS = 20.0        # 矢印の最大の太さ [pixel]
+const REACTION_ARROW_BEND = 0.5             # 矢印の曲がり具合 = 曲率 × 弦の長さ（0.5 で弧の膨らみは弦の長さの約 1/16。長さによらず同じ形）
+const REACTION_CENTER_RADIUS = 6.0          # 反応の中心に描く点の半径の最小 [pixel]（矢印の太さの半分より小さくはしない）
+
+let REACTION_ARROW_START_COLOR = rl.Color(255, 200, 200, 255)   # 矢印のグラデーションの色（淡い → 鮮やか → 濃い → 淡い が流れる）
+let REACTION_ARROW_MIDDLE_COLOR = rl.Color(230, 41, 55, 255)
+let REACTION_ARROW_END_COLOR = rl.Color(90, 0, 20, 255)         # 矢じりの色
+let REACTION_CENTER_COLOR = rl.Color(90, 0, 20, 255)            # 反応の中心の点の色
+
 let CANVAS_BACKGROUND_COLOR = rl.Color(245, 245, 245, 255)  # 化学種を描く窓の背景の色（円からはみ出す文字の色をこれに合わせて選ぶ）
 let DARK_LABEL_COLOR = rl.Color(30, 30, 30, 255)        # 明るい塗りの上の文字の色
 let LIGHT_LABEL_COLOR = rl.Color(255, 255, 255, 255)    # 暗い塗りの上の文字の色
@@ -129,6 +145,8 @@ class Position:
 #     contains_screen_point(point, screen_width, screen_height) -> bool — 窓の中の点が円に重なるか
 #     draw(screen_width, screen_height) -> None — 円と、中心に名前と量を描く
 #     draw_highlight_mark(screen_width, screen_height) -> None — クリックされた印を円の上に描く
+#     is_quantity_fixed() -> bool — 量が反応で変わらないか（既定 False。Solute は is_const）
+#     change_quantity(amount) -> None — 量を増減させる（量が一定の化学種では何もしない）
 # 例: mut h2 = Solute(name = "H2", pos = Position(0.5, 0.5), quantity = 0.1, color = rl.Color(0, 121, 241, 255), is_const = True)
 #     h2.get_radius()   # 50.0（の近く）
 trait Species:
@@ -194,6 +212,20 @@ trait Species:
         let mark_top = highlight_mark_top(center.y, self.get_radius())
         draw_centered_text(HIGHLIGHT_MARK_TEXT, center.x, mark_top, HIGHLIGHT_MARK_FONT_SIZE, HIGHLIGHT_MARK_COLOR)
 
+    # is_quantity_fixed — 量が反応で変わらない化学種か（外から無限に供給・拡散されて一定に保たれる）
+    #   戻り値: 既定は False。Solute は is_const を返す
+    # 例: proton.is_quantity_fixed()   # proton が Solute(is_const = True) なら True
+    fn is_quantity_fixed(let self) -> bool:
+        return False
+
+    # change_quantity — 量を amount だけ増減させる（反応の時間発展で kinetics.advance が呼ぶ）
+    #   amount: 量の変化（負なら減る）。⚠ self を書き換える
+    #   is_quantity_fixed() が True の化学種では何もしない（無限の供給・拡散で量が一定に保たれる）
+    # 例: species_list[0].change_quantity(-0.1)
+    fn change_quantity(mut self, let amount: float) -> None:
+        if not self.is_quantity_fixed():
+            self.quantity += amount
+
     protected:
     mut quantity: float
     mut pos: Position
@@ -205,15 +237,134 @@ class Adsorbate(Species):
 class Solute(Species):
     public:
     let is_const: bool
-    pass
 
+    # is_quantity_fixed — is_const が True なら、外から無限に供給・拡散されて量は一定（反応で変わらない）
+    #   戻り値: is_const
+    # 例: proton.is_quantity_fixed()   # True
+    fn is_quantity_fixed(let self) -> bool:
+        return self.is_const
+
+# Stoichiometry — 反応式の 1 項（化学種と、その係数）
+#   メンバー:
+#     species: Species（public）— 化学種。⚠ 作ったときの写しなので、量は更新されない。反応では名前（species.name）で
+#              化学種を指し、量は kinetics.advance に渡す化学種の並びから読む
+#     ratio: int（public・不変）— 化学量論係数（1 以上）
+# 例: cg.Stoichiometry(proton, 1)
 class Stoichiometry:
     public:
     mut species: Species
     let ratio: int
 
-new_type Fn_RateCoefficient: function[let Reaction, let env.TimeScale, let env.Potential]->float
+new_type Fn_RateCoefficient: function[let Reaction, let env.Potential]->float
 
+# check_stoichiometry — 反応式の片側の項がすべて係数 1 以上か確かめる（Reaction の __init__ が呼ぶ）
+#   entries:   反応式の片側の項
+#   side_name: エラーメッセージに出す側の名前（"node_A" など）
+#   係数が 1 未満の項があれば ValueError
+# 例: check_stoichiometry([Stoichiometry(proton, 1)], "node_A")
+fn check_stoichiometry(let entries: list[Stoichiometry], let side_name: str) -> None:
+    for entry in entries:
+        if entry.ratio < 1:
+            raise ValueError(side_name + ": the ratio of '" + entry.species.name + "' is " + str(entry.ratio) + "; it must be 1 or more")
+
+# log_scaled — 正の値の log10 を [lower_value, upper_value] から [lower_output, upper_output] へ線形に写す（範囲の外は端の値）
+#   value: 写す値（速度定数・反応速度など）。0 以下は lower_output（log が −∞）。NaN なら ValueError
+#   lower_value, upper_value: 写す範囲（0 < lower_value < upper_value）
+#   lower_output, upper_output: 範囲の端に対応する出力
+#   戻り値: lower_output + (upper_output - lower_output) × (log10 value - log10 lower_value) / (log10 upper_value - log10 lower_value)
+#           value ≤ lower_value なら lower_output、value ≥ upper_value なら upper_output
+# 例: log_scaled(100.0, 1.0e-2, 1.0e6, 5.0, 20.0)   # 12.5（log10 が範囲 -2〜6 のちょうど中央）
+fn log_scaled(let value: float, let lower_value: float, let upper_value: float, let lower_output: float, let upper_output: float) -> float:
+    if value != value:
+        raise ValueError("value is NaN; it cannot be scaled")
+    if value <= lower_value:
+        return lower_output
+    if value >= upper_value:
+        return upper_output
+    let fraction = (log10(value) - log10(lower_value)) / (log10(upper_value) - log10(lower_value))
+    return lower_output + (upper_output - lower_output) * fraction
+
+# reaction_flow_speed — 速度定数から、矢印のグラデーションが流れる速さを決める
+#   rate_constant: 正反応の速度定数（今の電位での値）
+#   戻り値: [周期/画面の秒]。速度定数 1e-2 以下で 0.5、1e6 以上で 4.5、その間は log10 に比例
+# 例: reaction_flow_speed(100.0)   # 2.5
+fn reaction_flow_speed(let rate_constant: float) -> float:
+    return log_scaled(rate_constant, SCALE_LOWER_VALUE, SCALE_UPPER_VALUE, MINIMUM_FLOW_CYCLES_PER_SECOND, MAXIMUM_FLOW_CYCLES_PER_SECOND)
+
+# reaction_arrow_thickness — 反応速度（速度定数 × 基質の量の積）から、矢印の太さを決める
+#   rate: 正反応の速度 k_f Π q^ν（kinetics.forward_reaction_rate の値）
+#   戻り値: [pixel]。速度 1e-2 以下（0 も）で 5、1e6 以上で 20、その間は log10 に比例
+# 例: reaction_arrow_thickness(100.0)   # 12.5
+fn reaction_arrow_thickness(let rate: float) -> float:
+    return log_scaled(rate, SCALE_LOWER_VALUE, SCALE_UPPER_VALUE, MINIMUM_ARROW_THICKNESS, MAXIMUM_ARROW_THICKNESS)
+
+# edge_point_toward — 円の中心から target へ向かう向きの、円周上の点を返す（矢印を円の縁から出す・縁で止めるため）
+#   circle_center: 円の中心 [pixel]
+#   radius: 円の半径 [pixel]
+#   target: 向かう先の点 [pixel]
+#   戻り値: circle_center + radius × (target - circle_center) / |target - circle_center|。target が中心と同じなら中心
+# 例: edge_point_toward(rl.Vector2(100.0, 100.0), 50.0, rl.Vector2(300.0, 100.0))   # rl.Vector2(150.0, 100.0)
+fn edge_point_toward(let circle_center: rl.Vector2, let radius: float, let target: rl.Vector2) -> rl.Vector2:
+    let offset_x = target.x - circle_center.x
+    let offset_y = target.y - circle_center.y
+    let distance = (offset_x * offset_x + offset_y * offset_y) ** 0.5
+    if distance == 0.0:
+        return circle_center
+    return rl.Vector2(circle_center.x + radius * offset_x / distance, circle_center.y + radius * offset_y / distance)
+
+# distance_between — 2 点の距離を返す
+#   first, second: 点 [pixel]
+#   戻り値: 距離 [pixel]
+# 例: distance_between(rl.Vector2(0.0, 0.0), rl.Vector2(3.0, 4.0))   # 5.0
+fn distance_between(let first: rl.Vector2, let second: rl.Vector2) -> float:
+    let offset_x = second.x - first.x
+    let offset_y = second.y - first.y
+    return (offset_x * offset_x + offset_y * offset_y) ** 0.5
+
+# draw_reaction_segment — 反応の矢印の 1 本（基質 → 中心、または中心 → 生成物）を、緩やかな円弧で描く
+#   start, end: 始点・終点 [pixel]
+#   thickness: 太さ [pixel]
+#   flow_phase: グラデーションの位相 [周期]（小数部だけが効く）
+#   has_head: True なら終点に矢じりを描く（中心 → 生成物）、False なら矢じりなし（基質 → 中心）
+#   曲率は REACTION_ARROW_BEND / 弦の長さ（正なので、進む向きに見て左へ曲がる）。始点と終点が同じなら何も描かない
+# 例: draw_reaction_segment(rl.Vector2(100.0, 300.0), rl.Vector2(300.0, 300.0), 8.0, 0.25, True)
+fn draw_reaction_segment(let start: rl.Vector2, let end: rl.Vector2, let thickness: float, let flow_phase: float, let has_head: bool) -> None:
+    let chord_length = distance_between(start, end)
+    if chord_length == 0.0:
+        return
+    let curvature = REACTION_ARROW_BEND / chord_length
+    if has_head:
+        rl.draw_curved_arrow_flowing(start.x, start.y, end.x, end.y, thickness, REACTION_ARROW_START_COLOR, REACTION_ARROW_MIDDLE_COLOR, REACTION_ARROW_END_COLOR, curvature, flow_phase)
+    else:
+        rl.draw_curved_line_flowing(start.x, start.y, end.x, end.y, thickness, REACTION_ARROW_START_COLOR, REACTION_ARROW_MIDDLE_COLOR, REACTION_ARROW_END_COLOR, curvature, flow_phase)
+
+# find_species_by_name — 化学種の並びから名前で化学種を探す（反応が名前で指す化学種の、今の量・位置を読むため）
+#   species_list: 化学種の並び
+#   species_name: 名前
+#   戻り値: 最初に見つかった化学種。無ければ ValueError
+# 例: find_species_by_name(species_pool, "H_ads").get_radius()
+fn find_species_by_name(let species_list: list[Species], let species_name: str) -> Species:
+    for species in species_list:
+        if species.name == species_name:
+            return species
+    raise ValueError("species '" + species_name + "' is not in the species list")
+
+# Reaction — 化学種（node_A の側）と化学種（node_B の側）をつなぐ反応。node_A → node_B を正反応とする
+#   メンバー:
+#     node_A: list[Stoichiometry]（public）— 正反応の反応物（左辺）
+#     node_B: list[Stoichiometry]（public）— 正反応の生成物（右辺）
+#     fw_rate_coefficient: Fn_RateCoefficient（public・不変）— 正反応の速度定数を返す関数（kinetics で作る）
+#     bw_rate_coefficient: Fn_RateCoefficient（public・不変）— 逆反応の速度定数を返す関数
+#     is_reversible: bool（public・不変）— False なら逆反応を起こさない
+#     pos: Position（private・不変）— 反応の中心の位置（窓の大きさに対する割合）。基質と生成物を結ぶ矢印がここを通る
+#     forward_rate_coefficient(potential) -> float / backward_rate_coefficient(potential) -> float — その電位での速度定数
+#     net_stoichiometry(species_name) -> int — 正反応が 1 回進んだときの、その化学種の数の変化（右辺の係数 - 左辺の係数）
+#     species_names() -> list[str] — 反応に出てくる化学種の名前（重複なし・左辺から順）
+#     draw(species_list, rate, flow_phase, is_backward, screen_width, screen_height) -> None — 速いほうの向きに、
+#         出発側 → 中心 → 行き先の矢印を描く（is_backward が True なら生成物 → 基質）
+#     draw_through_center(...)（private）— draw の本体（出発側・行き先の項を受け取って描く）
+#   反応の速さ（質量作用）と量の時間発展は kinetics にある。化学種は名前で指す（Stoichiometry の注意を参照）
+# 例: let volmer = Reaction([Stoichiometry(proton, 1), Stoichiometry(vacancy, 1)], [Stoichiometry(H_ads, 1)], fw, bw, Position(0.3, 0.5))
 class Reaction:
     public:
     mut node_A: list[Stoichiometry]
@@ -224,23 +375,119 @@ class Reaction:
 
     let is_reversible: bool
 
+    # __init__ — 反応を作る。係数が 1 未満の項があれば ValueError
+    #   node_A, node_B: 正反応の左辺・右辺
+    #   fw_rate_coefficient, bw_rate_coefficient: 正・逆反応の速度定数の関数（kinetics.butler_volmer_k_pair などで作る）
+    #   pos: 反応の中心の位置（窓の大きさに対する割合）
+    #   is_reversible: False なら逆反応を起こさない（backward_rate_coefficient が 0）
     fn __init__(
-        mut self, 
-        let node_A: list[Stoichiometry], 
+        mut self,
+        let node_A: list[Stoichiometry],
         let node_B: list[Stoichiometry],
         let fw_rate_coefficient: Fn_RateCoefficient,
         let bw_rate_coefficient: Fn_RateCoefficient,
+        let pos: Position,
         let is_reversible: bool = True
         )->Self:
-        
+
+        check_stoichiometry(node_A, "node_A")
+        check_stoichiometry(node_B, "node_B")
         self.node_A = node_A
         self.node_B = node_B
-        
+
         self.fw_rate_coefficient = fw_rate_coefficient
         self.bw_rate_coefficient = bw_rate_coefficient
 
+        self.pos = pos
         self.is_reversible = is_reversible
         return self
+
+    # draw — 反応を矢印で描く。速いほうの向きに、出発側の円の縁 → 反応の中心（矢じりなし）、中心 → 行き先の円の縁（矢じりあり）
+    #   （begin_drawing と end_drawing の間、化学種の円より先に呼ぶ）
+    #   species_list: 化学種の並び（今の量・位置を名前で読む。反応の化学種が無ければ ValueError）
+    #   rate: 描く向きの反応の速さ（kinetics.forward_reaction_rate / backward_reaction_rate の大きいほう）。太さを決める
+    #         （reaction_arrow_thickness）
+    #   flow_phase: グラデーションの位相 [周期]（呼ぶ側が reaction_flow_speed × 画面の経過時間 を積み上げる）
+    #   is_backward: False なら基質（node_A）→ 生成物（node_B）、True なら逆向き（逆反応のほうが速いとき）
+    #   screen_width, screen_height: 窓の幅・高さ [pixel]
+    #   中心が化学種の円の中に入っている矢印は描かない（向きが決まらない）。中心には点を描く
+    # 例: volmer.draw(species_pool, 3.2, flow_phase, False, rl.get_screen_width(), rl.get_screen_height())
+    fn draw(let self, let species_list: list[Species], let rate: float, let flow_phase: float, let is_backward: bool, let screen_width: int, let screen_height: int) -> None:
+        let thickness = reaction_arrow_thickness(rate)
+        if is_backward:
+            self.draw_through_center(species_list, self.node_B, self.node_A, thickness, flow_phase, screen_width, screen_height)
+        else:
+            self.draw_through_center(species_list, self.node_A, self.node_B, thickness, flow_phase, screen_width, screen_height)
+        let center = self.pos.to_screen(screen_width, screen_height)
+        rl.draw_filled_circle(center.x, center.y, max(REACTION_CENTER_RADIUS, thickness / 2.0), REACTION_CENTER_COLOR)
+
+    private:
+    let pos: Position
+
+    # draw_through_center — sources の各化学種の円の縁 → 反応の中心（矢じりなし）、中心 → targets の各化学種の円の縁（矢じりあり）を描く
+    #   species_list: 化学種の並び（今の量・位置を名前で読む）
+    #   sources, targets: 出発側・行き先の反応式の項（draw が向きに応じて node_A / node_B を渡す）
+    #   thickness: 太さ [pixel]
+    #   flow_phase: グラデーションの位相 [周期]
+    #   screen_width, screen_height: 窓の幅・高さ [pixel]
+    # 例: self.draw_through_center(species_list, self.node_A, self.node_B, 8.0, 0.25, 1100, 700)
+    fn draw_through_center(let self, let species_list: list[Species], let sources: list[Stoichiometry], let targets: list[Stoichiometry], let thickness: float, let flow_phase: float, let screen_width: int, let screen_height: int) -> None:
+        let center = self.pos.to_screen(screen_width, screen_height)
+        for entry in sources:
+            let source = find_species_by_name(species_list, entry.species.name)
+            let source_center = source.get_screen_center(screen_width, screen_height)
+            if distance_between(source_center, center) > source.get_radius():
+                draw_reaction_segment(edge_point_toward(source_center, source.get_radius(), center), center, thickness, flow_phase, False)
+        for entry in targets:
+            let target = find_species_by_name(species_list, entry.species.name)
+            let target_center = target.get_screen_center(screen_width, screen_height)
+            if distance_between(target_center, center) > target.get_radius():
+                draw_reaction_segment(center, edge_point_toward(target_center, target.get_radius(), center), thickness, flow_phase, True)
+
+    public:
+
+    # forward_rate_coefficient — 電位 potential での正反応の速度定数を返す
+    #   potential: 電極の電位（main.ar が決めた値を渡す）
+    #   戻り値: fw_rate_coefficient(self, potential)
+    # 例: volmer.forward_rate_coefficient(env.Potential(-0.1))
+    fn forward_rate_coefficient(let self, let potential: env.Potential) -> float:
+        let coefficient_function = self.fw_rate_coefficient => function[let Reaction, let env.Potential]->float
+        return coefficient_function(self, potential)
+
+    # backward_rate_coefficient — 電位 potential での逆反応の速度定数を返す
+    #   potential: 電極の電位
+    #   戻り値: bw_rate_coefficient(self, potential)。is_reversible が False なら 0.0
+    # 例: volmer.backward_rate_coefficient(env.Potential(-0.1))
+    fn backward_rate_coefficient(let self, let potential: env.Potential) -> float:
+        if not self.is_reversible:
+            return 0.0
+        let coefficient_function = self.bw_rate_coefficient => function[let Reaction, let env.Potential]->float
+        return coefficient_function(self, potential)
+
+    # net_stoichiometry — 正反応が 1 回進んだときの、化学種 species_name の数の変化を返す
+    #   species_name: 化学種の名前
+    #   戻り値: 右辺（node_B）の係数の和 - 左辺（node_A）の係数の和。出てこなければ 0
+    # 例: volmer.net_stoichiometry("H_ads")   # 1（H+ + * → H_ads）
+    #     volmer.net_stoichiometry("vacancy") # -1
+    fn net_stoichiometry(let self, let species_name: str) -> int:
+        mut change = 0
+        for entry in self.node_B:
+            if entry.species.name == species_name:
+                change += entry.ratio
+        for entry in self.node_A:
+            if entry.species.name == species_name:
+                change -= entry.ratio
+        return change
+
+    # species_names — 反応に出てくる化学種の名前を返す（重複なし・左辺、右辺の順）
+    #   戻り値: 名前の並び
+    # 例: volmer.species_names()   # ["H+", "vacancy", "H_ads"]
+    fn species_names(let self) -> list[str]:
+        mut names: list[str] = []
+        for entry in self.node_A + self.node_B:
+            if entry.species.name not in names:
+                names.append(entry.species.name)
+        return names
 
 
 # ---- 化学種の並びを描く・クリックされた化学種を探す ----

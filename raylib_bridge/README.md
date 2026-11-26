@@ -41,7 +41,7 @@ rl.close_window()
 - 文字列（`const char*`）には `str` ではなく `bytes` を渡します（`"text".encode("utf-8")`）。raylib の既定のフォントは ASCII だけです。
 - 色は `rl.Color(r, g, b, a)`、座標は `rl.Vector2(x, y)`（float）。raylib の `RED` などの色の定数はありません。
 - フラグ・ログの重さ・キーなどの数値は [raylib_consts.ar](raylib_consts.ar) にあります。
-- 使える関数の一覧は [raylib_bridge.h](raylib_bridge.h)。次の 5 つは raylib に無い、この DLL だけの関数です。
+- 使える関数の一覧は [raylib_bridge.h](raylib_bridge.h)。次の 7 つは raylib に無い、この DLL だけの関数です。
   - `draw_filled_circle(center_x, center_y, radius, color)` — 円（座標・半径は絶対 pixel。半径が大きくても縁が滑らか）
   - `draw_curved_arrow(start_x, start_y, end_x, end_y, thickness, start_color, end_color, curvature)` — 2 点を結ぶ矢印。
     色は始点→終点のグラデーション（矢じりは終点の色）、`curvature` は 1/R（1/pixel・0 で直線・正なら進む向きに見て左へ曲がる）。
@@ -54,7 +54,11 @@ rl.close_window()
     色が始点→矢じりへ流れる矢印（毎フレーム呼ぶ）。軸に `start_color → middle_color → end_color → start_color` の
     1 周分（それぞれ軸の 1/3）が並び、`flow_phase`（単位は周期＝軸 1 本分。小数部だけが効く）だけ矢じり側へずれる。
     1 周を `cycle_seconds` 秒にするなら `flow_phase = rl.get_time() / cycle_seconds`。矢じりは `end_color` のまま
+  - `draw_curved_line_flowing(...)` — `draw_curved_arrow_flowing` から矢じりを除いたもの（軸が終点まで届く）。引数は同じ。
+    反応の矢印の、基質から反応の中心までの部分に使う
   - `read_screen_pixel(x, y)` — 描いた画素の色を読む（テスト用）
+  - `save_screen_image(file_name)` — そのフレームに描いたものを画像（`.png`）に保存する。非表示の窓でも使えるので、窓を出さずに
+    見た目を確かめられる（`begin_drawing` と `end_drawing` の間で呼ぶ・書けたら `True`）
 
 ## 関数を足すとき
 

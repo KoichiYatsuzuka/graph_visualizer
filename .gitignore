@@ -11,3 +11,6 @@
 /slider_panel/ArrowExports.g.cs
 /slider_panel/SliderPanelBridge.dll
 /slider_panel/SliderPanelBridge_native.dll
+
+# Python が waveform.py を読み込んだときのキャッシュ
+__pycache__/

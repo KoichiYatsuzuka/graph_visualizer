@@ -1,0 +1,362 @@
+# test_kinetics.ar — kinetics（速度定数・反応速度・量の時間発展）と、chemical_graphs の反応まわり（Reaction・量の増減）の自動テスト
+#
+# 実行: arrow tests/test_kinetics.ar（tests/run_tests.ps1 が tests/test_*.ar をまとめて走らせる）。窓は開かない。
+#
+# 見ること:
+#   1. 速度定数: 平衡電位で k0、還元は電位が下がると exp(α f |η|) 倍、酸化は上がると exp((1 - α) f η) 倍、
+#      正 / 逆の比は exp(-f (E - E0))。おかしなパラメータは ValueError
+#   2. Reaction: 速度定数の関数を呼べる・不可逆なら逆反応 0・net_stoichiometry・species_names・係数 0 は ValueError
+#   3. 量の増減: Adsorbate は変わる、is_const の Solute は変わらない
+#   4. 質量作用: net_rate（係数 2 を含む）、番号で引く形の積と偏微分、ReactionNetwork の Jacobian と d q / d t
+#   5. 連立一次方程式: ピボットの入れ替えが要る行列、特異な行列は ValueError
+#   6. advance: Volmer–Heyrovsky で、陰的オイラーの 1 歩が解析式と一致・被覆率の和が 1 のまま・定常状態に収束・
+#      一定の溶存種は変わらない・長い time_step でも発散しない。名前の重複などは ValueError
+#   8. ReactionNetwork.relax: 1 サブステップが厳密な指数緩和と一致・一定電位で定常状態へ近づく・時間刻みが長ければ定常状態・
+#      総和は最も大きい吸着種で 1 に合わせる・電位が空なら変えない・並びの違い・負の時間刻みは ValueError
+#   7. settle_to_steady_state: 解析的な定常被覆率に一致・初期状態によらない（量が電位だけで決まる）・被覆率の和は 1・
+#      反応が無ければ何もしない・電位が極端で exp があふれると OverflowError
+# 期待と違えば RuntimeError を raise して非 0 で終わる。
+
+import[cpp-dll] ..raylib_bridge.raylib_bridge as rl
+import ..environment as env
+import ..chemical_graphs as cg
+import ..kinetics as kn
+
+const TOLERANCE = 1e-9
+const ALPHA = 0.5
+const VOLMER_E0 = 0.1
+const VOLMER_K0 = 2.0
+const HEYROVSKY_E0 = -0.1
+const HEYROVSKY_K0 = 0.5
+const TEST_POTENTIAL = -0.05
+
+let GRAY = rl.Color(130, 130, 130, 255)
+let CENTER = cg.Position(0.5, 0.5)                 # 反応の中心（描画しないテストでは使わない）
+
+# expect_true — 条件が偽なら RuntimeError を投げ、真なら OK を表示する
+#   condition: 確かめる条件
+#   label:     表示とエラーメッセージに出す説明
+# 例: expect_true(1 == 1, "one is one")
+fn expect_true(let condition: bool, let label: str) -> None:
+    if not condition:
+        raise RuntimeError("FAILED: " + label)
+    print("OK:", label)
+
+# expect_close — 2 つの float の相対差（|actual - expected| / max(1, |expected|)）が TOLERANCE 以下か確かめる
+#   actual, expected: 比べる値
+#   label: 表示とエラーメッセージに出す説明
+# 例: expect_close(kn.butler_volmer_k(0.0, 0.5, 2.0), 2.0, "k at the equilibrium potential")
+fn expect_close(let actual: float, let expected: float, let label: str) -> None:
+    let scale = max(1.0, abs(expected))
+    expect_true(abs(actual - expected) / scale <= TOLERANCE, label + ": " + str(actual) + " (expected " + str(expected) + ")")
+
+# thermal_voltage_inverse — F / (R T) [1/V]（kinetics と同じ定数・室温）
+#   戻り値: kn.F / (kn.R * kn.ROOM_TEMP)
+# 例: exp(-ALPHA * thermal_voltage_inverse() * 0.1)
+fn thermal_voltage_inverse() -> float:
+    return kn.F / (kn.R * kn.ROOM_TEMP)
+
+# make_vacancy / make_h_ads / make_proton / make_h2 — テストに使う化学種を作る
+#   quantity: 量（被覆率・濃度）
+#   戻り値: 化学種（vacancy・H_ads は Adsorbate、H+・H2 は is_const の Solute）
+# 例: make_vacancy(0.3)
+fn make_vacancy(let quantity: float) -> cg.Adsorbate:
+    return cg.Adsorbate(name = "vacancy", pos = cg.Position(0.1, 0.1), quantity = quantity, color = GRAY)
+
+fn make_h_ads(let quantity: float) -> cg.Adsorbate:
+    return cg.Adsorbate(name = "H_ads", pos = cg.Position(0.2, 0.2), quantity = quantity, color = GRAY)
+
+fn make_proton(let quantity: float) -> cg.Solute:
+    return cg.Solute(name = "H+", pos = cg.Position(0.3, 0.3), quantity = quantity, color = GRAY, is_const = True)
+
+fn make_h2(let quantity: float) -> cg.Solute:
+    return cg.Solute(name = "H2", pos = cg.Position(0.4, 0.4), quantity = quantity, color = GRAY, is_const = True)
+
+# make_volmer — Volmer 反応 H+ + e- + * → H_ads（正反応 = 還元）
+#   is_reversible: False なら逆反応なし
+#   戻り値: Reaction
+# 例: make_volmer(True)
+fn make_volmer(let is_reversible: bool) -> cg.Reaction:
+    let coefficients = kn.butler_volmer_k_pair(VOLMER_E0, VOLMER_K0, ALPHA)   # ⚠ 関数の中では let a, let b = .. が使えない（Arrow 0.7.2）
+    return cg.Reaction(
+        [cg.Stoichiometry(make_proton(1.0), 1), cg.Stoichiometry(make_vacancy(0.0), 1)],
+        [cg.Stoichiometry(make_h_ads(0.0), 1)],
+        coefficients[0], coefficients[1], CENTER, is_reversible)
+
+# make_heyrovsky — Heyrovsky 反応 H_ads + H+ + e- → H2 + *（正反応 = 還元）
+#   戻り値: Reaction
+# 例: make_heyrovsky()
+fn make_heyrovsky() -> cg.Reaction:
+    let coefficients = kn.butler_volmer_k_pair(HEYROVSKY_E0, HEYROVSKY_K0, ALPHA)
+    return cg.Reaction(
+        [cg.Stoichiometry(make_h_ads(0.0), 1), cg.Stoichiometry(make_proton(1.0), 1)],
+        [cg.Stoichiometry(make_h2(1.0), 1), cg.Stoichiometry(make_vacancy(0.0), 1)],
+        coefficients[0], coefficients[1], CENTER)
+
+# generator_raises_value_error — electron_transfer_k_generator がパラメータの誤りで ValueError を投げれば True
+#   center_potential, k0, alpha, temp: 渡すパラメータ
+#   戻り値: ValueError なら True
+# 例: generator_raises_value_error(0.0, -1.0, 0.5, 298.0) == True
+fn generator_raises_value_error(let center_potential: float, let k0: float, let alpha: float, let temp: float) -> bool:
+    try:
+        let _ = kn.electron_transfer_k_generator(center_potential, k0, alpha, kn.TransferDirection.reduction, temp)
+    except ValueError:
+        return True
+    return False
+
+# advance_raises_value_error — advance が ValueError を投げれば True
+#   species_list, reactions, time_step: advance に渡す値（電位は TEST_POTENTIAL）
+#   戻り値: ValueError なら True
+# 例: advance_raises_value_error(species, [make_volmer(True)], -1.0) == True
+fn advance_raises_value_error(mut species_list: list[cg.Species], let reactions: list[cg.Reaction], let time_step: float) -> bool:
+    try:
+        kn.advance(species_list, reactions, env.Potential(TEST_POTENTIAL), time_step)
+    except ValueError:
+        return True
+    return False
+
+# steady_h_coverage — Volmer–Heyrovsky の H_ads の定常被覆率（H+ = H2 = 1 で一定）
+#   potential: 電位 [V]
+#   戻り値: (kVf + kHb) / (kVf + kHb + kVb + kHf)
+# 例: steady_h_coverage(-0.05)
+fn steady_h_coverage(let potential: float) -> float:
+    let volmer = make_volmer(True)
+    let heyrovsky = make_heyrovsky()
+    let electrode_potential = env.Potential(potential)
+    let gain = volmer.forward_rate_coefficient(electrode_potential) + heyrovsky.backward_rate_coefficient(electrode_potential)
+    let loss = volmer.backward_rate_coefficient(electrode_potential) + heyrovsky.forward_rate_coefficient(electrode_potential)
+    return gain / (gain + loss)
+
+# check_rate_coefficients — 1. 速度定数
+# 例: check_rate_coefficients()
+fn check_rate_coefficients() -> None:
+    let f = thermal_voltage_inverse()
+    let reaction = make_volmer(True)
+    expect_close(kn.butler_volmer_k(0.0, ALPHA, VOLMER_K0), VOLMER_K0, "butler_volmer_k is k0 at zero overpotential")
+    # 生成した関数は Reaction を通して呼ぶ（正反応 = 還元、逆反応 = 酸化。α は 0.3 にして 1 - α と区別する）
+    let reduction = kn.electron_transfer_k_generator(VOLMER_E0, VOLMER_K0, 0.3, kn.TransferDirection.reduction)
+    let oxidation = kn.electron_transfer_k_generator(VOLMER_E0, VOLMER_K0, 0.3, kn.TransferDirection.oxidation)
+    let generated = cg.Reaction([cg.Stoichiometry(make_proton(1.0), 1), cg.Stoichiometry(make_vacancy(0.0), 1)], [cg.Stoichiometry(make_h_ads(0.0), 1)], reduction, oxidation, CENTER)
+    expect_close(generated.forward_rate_coefficient(env.Potential(VOLMER_E0)), VOLMER_K0, "reduction k is k0 at E0")
+    expect_close(generated.backward_rate_coefficient(env.Potential(VOLMER_E0)), VOLMER_K0, "oxidation k is k0 at E0")
+    expect_close(generated.forward_rate_coefficient(env.Potential(VOLMER_E0 - 0.1)), VOLMER_K0 * exp(0.3 * f * 0.1), "reduction k grows by exp(alpha f 0.1) at E0 - 0.1 V")
+    expect_close(generated.backward_rate_coefficient(env.Potential(VOLMER_E0 + 0.1)), VOLMER_K0 * exp((1.0 - 0.3) * f * 0.1), "oxidation k grows by exp((1 - alpha) f 0.1) at E0 + 0.1 V")
+    let ratio = reaction.forward_rate_coefficient(env.Potential(TEST_POTENTIAL)) / reaction.backward_rate_coefficient(env.Potential(TEST_POTENTIAL))
+    expect_close(ratio, exp(-f * (TEST_POTENTIAL - VOLMER_E0)), "forward / backward is exp(-f (E - E0)) for the pair")
+    expect_true(generator_raises_value_error(0.0, -1.0, 0.5, kn.ROOM_TEMP), "negative k0 is ValueError")
+    expect_true(generator_raises_value_error(0.0, 1.0, 1.5, kn.ROOM_TEMP), "alpha above 1 is ValueError")
+    expect_true(generator_raises_value_error(0.0, 1.0, 0.5, 0.0), "temperature 0 is ValueError")
+    expect_true(generator_raises_value_error(float("nan"), 1.0, 0.5, kn.ROOM_TEMP), "NaN center potential is ValueError")
+
+# check_reaction — 2. Reaction のメソッドと引数の検査
+# 例: check_reaction()
+fn check_reaction() -> None:
+    let volmer = make_volmer(True)
+    let irreversible = make_volmer(False)
+    expect_true(irreversible.backward_rate_coefficient(env.Potential(0.5)) == 0.0, "an irreversible reaction has backward k = 0")
+    expect_true(volmer.net_stoichiometry("H_ads") == 1 and volmer.net_stoichiometry("vacancy") == -1, "Volmer makes one H_ads from one vacancy")
+    expect_true(volmer.net_stoichiometry("H+") == -1 and volmer.net_stoichiometry("H2") == 0, "Volmer consumes one H+ and no H2")
+    expect_true(volmer.species_names() == ["H+", "vacancy", "H_ads"], "species_names lists left side then right side")
+    let coefficients = kn.butler_volmer_k_pair(0.0, 1.0, 0.5)
+    mut raised_value_error = False
+    try:
+        let _ = cg.Reaction([cg.Stoichiometry(make_h_ads(0.5), 0)], [cg.Stoichiometry(make_h2(1.0), 1)], coefficients[0], coefficients[1], CENTER)
+    except ValueError:
+        raised_value_error = True
+    expect_true(raised_value_error, "a ratio of 0 is ValueError")
+
+# check_quantity_change — 3. 量の増減と一定の溶存種
+# 例: check_quantity_change()
+fn check_quantity_change() -> None:
+    mut species_list: list[cg.Species] = [make_h_ads(0.5), make_proton(1.0), cg.Solute(name = "OH-", pos = cg.Position(0.5, 0.5), quantity = 0.2, color = GRAY, is_const = False)]
+    species_list[0].change_quantity(0.25)
+    species_list[1].change_quantity(0.25)
+    species_list[2].change_quantity(0.25)
+    expect_close(species_list[0].get_quantity(), 0.75, "change_quantity changes an Adsorbate")
+    expect_true(species_list[1].get_quantity() == 1.0 and species_list[1].is_quantity_fixed(), "change_quantity leaves an is_const Solute unchanged")
+    expect_close(species_list[2].get_quantity(), 0.45, "change_quantity changes a Solute with is_const False")
+
+# check_mass_action — 4. 質量作用の速さと偏微分
+# 例: check_mass_action()
+fn check_mass_action() -> None:
+    let potential = env.Potential(TEST_POTENTIAL)
+    let volmer = make_volmer(True)
+    let quantities: dict[str, float] = {"H+": 1.0, "vacancy": 0.3, "H_ads": 0.7, "H2": 1.0}
+    let expected_rate = volmer.forward_rate_coefficient(potential) * 1.0 * 0.3 - volmer.backward_rate_coefficient(potential) * 0.7
+    expect_close(kn.net_rate(volmer, quantities, potential), expected_rate, "net_rate is kf [H+] theta_vac - kb theta_H")
+    expect_close(kn.forward_reaction_rate(volmer, quantities, potential), volmer.forward_rate_coefficient(potential) * 0.3, "forward_reaction_rate is kf [H+] theta_vac (no backward term)")
+    expect_close(kn.backward_reaction_rate(volmer, quantities, potential), volmer.backward_rate_coefficient(potential) * 0.7, "backward_reaction_rate is kb theta_H (no forward term)")
+    expect_close(kn.forward_reaction_rate(volmer, quantities, potential) - kn.backward_reaction_rate(volmer, quantities, potential), kn.net_rate(volmer, quantities, potential), "forward - backward is net_rate")
+    expect_true(kn.backward_reaction_rate(make_volmer(False), quantities, potential) == 0.0, "backward_reaction_rate of an irreversible reaction is 0")
+    # Tafel 反応 2 H_ads → H2 + 2 vacancy（係数 2）
+    let coefficients = kn.butler_volmer_k_pair(0.0, 1.0, 0.5)
+    let tafel = cg.Reaction([cg.Stoichiometry(make_h_ads(0.0), 2)], [cg.Stoichiometry(make_h2(1.0), 1), cg.Stoichiometry(make_vacancy(0.0), 2)], coefficients[0], coefficients[1], CENTER)
+    expect_close(kn.mass_action_product(tafel.node_A, quantities), 0.49, "mass_action_product with ratio 2 is theta_H ** 2")
+    expect_true(tafel.net_stoichiometry("vacancy") == 2 and tafel.net_stoichiometry("H_ads") == -2, "Tafel net_stoichiometry uses the ratios")
+    # 番号で引く形（番号 0 = vacancy 0.3、1 = H_ads 0.7、2 = H2 1.0）
+    let numbered: list[float] = [0.3, 0.7, 1.0]
+    expect_close(kn.product_of_terms([1], [2], numbered), 0.49, "product_of_terms with ratio 2 is theta_H ** 2")
+    expect_close(kn.product_of_terms_derivative([1], [2], numbered, 1), 1.4, "its derivative is 2 theta_H")
+    expect_close(kn.product_of_terms_derivative([2, 0], [1, 2], numbered, 0), 0.6, "derivative of H2 * vac ** 2 by vac is 2 vac H2")
+    expect_true(kn.product_of_terms_derivative([1], [2], numbered, 2) == 0.0, "derivative by an absent species is 0")
+    # ReactionNetwork の Jacobian: dθ_H/dt = -2 (kf θ_H² - kb p θ_vac²)
+    let tafel_species: list[cg.Species] = [make_vacancy(0.3), make_h_ads(0.7), make_h2(1.0)]
+    let tafel_reactions: list[cg.Reaction] = [tafel]
+    let network = kn.ReactionNetwork(tafel_species, tafel_reactions)
+    let tafel_coefficients = network.rate_coefficients(potential)
+    let tafel_quantities = network.read_quantities(tafel_species)
+    expect_close(network.jacobian_entry(1, 1, tafel_quantities, tafel_coefficients), -4.0 * tafel_coefficients[0][0] * 0.7, "jacobian d(dθ_H/dt)/dθ_H is -4 kf θ_H")
+    expect_close(network.jacobian_entry(1, 0, tafel_quantities, tafel_coefficients), 4.0 * tafel_coefficients[1][0] * 1.0 * 0.3, "jacobian d(dθ_H/dt)/dθ_vac is 4 kb p θ_vac")
+    expect_close(network.time_derivatives(tafel_quantities, tafel_coefficients)[1], -2.0 * kn.net_rate(tafel, kn.quantities_by_name(tafel_species), potential), "time_derivatives agrees with -2 net_rate")
+    expect_true(network.time_derivatives(tafel_quantities, tafel_coefficients)[2] == 0.0, "time_derivatives is 0 for a constant solute")
+
+# check_linear_system — 5. 連立一次方程式
+# 例: check_linear_system()
+fn check_linear_system() -> None:
+    # 先頭の対角が 0 なので行の入れ替えが要る。解は (1, 2, 3)
+    let matrix: list[list[float]] = [[0.0, 2.0, 1.0], [1.0, 1.0, 1.0], [2.0, 0.0, 3.0]]
+    let solution = kn.solve_linear_system(matrix, [7.0, 6.0, 11.0])
+    expect_close(solution[0], 1.0, "solve_linear_system x0 (needs a row swap)")
+    expect_close(solution[1], 2.0, "solve_linear_system x1")
+    expect_close(solution[2], 3.0, "solve_linear_system x2")
+    mut raised_on_singular = False
+    try:
+        let _ = kn.solve_linear_system([[1.0, 2.0], [2.0, 4.0]], [1.0, 2.0])
+    except ValueError:
+        raised_on_singular = True
+    expect_true(raised_on_singular, "a singular matrix is ValueError")
+
+# check_advance — 6. 量の時間発展
+# 例: check_advance()
+fn check_advance() -> None:
+    let potential_value = TEST_POTENTIAL
+    let potential = env.Potential(potential_value)
+    let reactions: list[cg.Reaction] = [make_volmer(True), make_heyrovsky()]
+    mut species_list: list[cg.Species] = [make_vacancy(1.0), make_h_ads(0.0), make_h2(1.0), make_proton(1.0)]
+
+    # 1 歩: dθ/dt = a - b θ（a = kVf + kHb、b = a + kVb + kHf）の陰的オイラーは θ1 = (θ0 + h a) / (1 + h b)
+    let time_step = 0.3
+    let gain = reactions[0].forward_rate_coefficient(potential) + reactions[1].backward_rate_coefficient(potential)
+    let loss = reactions[0].backward_rate_coefficient(potential) + reactions[1].forward_rate_coefficient(potential)
+    kn.advance(species_list, reactions, potential, time_step)
+    expect_close(species_list[1].get_quantity(), (0.0 + time_step * gain) / (1.0 + time_step * (gain + loss)), "one step matches the implicit Euler formula")
+    expect_close(species_list[0].get_quantity() + species_list[1].get_quantity(), 1.0, "theta_vac + theta_H stays 1")
+    expect_true(species_list[2].get_quantity() == 1.0 and species_list[3].get_quantity() == 1.0, "constant solutes (H2, H+) do not change")
+
+    mut step_index = 0
+    while step_index < 200:
+        kn.advance(species_list, reactions, potential, 0.5)
+        step_index += 1
+    expect_close(species_list[1].get_quantity(), steady_h_coverage(potential_value), "theta_H converges to the steady state")
+    expect_close(species_list[0].get_quantity() + species_list[1].get_quantity(), 1.0, "theta_vac + theta_H is still 1 after 200 steps")
+
+    # 速度定数が大きい電位で長い time_step でも発散せず、定常状態へ行く（陰的なので）
+    mut stiff_species: list[cg.Species] = [make_vacancy(1.0), make_h_ads(0.0), make_h2(1.0), make_proton(1.0)]
+    kn.advance(stiff_species, reactions, env.Potential(-0.6), 1000.0)
+    let stiff_coverage = stiff_species[1].get_quantity()
+    expect_true(stiff_coverage >= 0.0 and stiff_coverage <= 1.0, "a long time_step at a strongly reducing potential stays in [0, 1]: " + str(stiff_coverage))
+    expect_close(stiff_coverage, steady_h_coverage(-0.6), "and lands near the steady state")
+
+    kn.advance(species_list, reactions, potential, 0.0)
+    expect_close(species_list[1].get_quantity(), steady_h_coverage(potential_value), "time_step 0 changes nothing")
+
+    mut duplicated: list[cg.Species] = [make_vacancy(1.0), make_vacancy(0.0), make_h_ads(0.0), make_h2(1.0), make_proton(1.0)]
+    expect_true(advance_raises_value_error(duplicated, reactions, 0.1), "duplicated species names are ValueError")
+    mut missing: list[cg.Species] = [make_vacancy(1.0), make_h_ads(0.0), make_proton(1.0)]
+    expect_true(advance_raises_value_error(missing, reactions, 0.1), "a reaction species missing from the list is ValueError")
+    expect_true(advance_raises_value_error(species_list, reactions, -0.1), "a negative time_step is ValueError")
+
+# check_steady_state — 7. 定常状態への移動
+# 例: check_steady_state()
+fn check_steady_state() -> None:
+    let reactions: list[cg.Reaction] = [make_volmer(True), make_heyrovsky()]
+    for potential_value in [0.3, 0.0, -0.05, -0.3]:
+        mut from_empty: list[cg.Species] = [make_vacancy(1.0), make_h_ads(0.0), make_h2(1.0), make_proton(1.0)]
+        mut from_full: list[cg.Species] = [make_vacancy(0.0), make_h_ads(1.0), make_h2(1.0), make_proton(1.0)]
+        let iterations = kn.settle_to_steady_state(from_empty, reactions, env.Potential(potential_value))
+        let _ = kn.settle_to_steady_state(from_full, reactions, env.Potential(potential_value))
+        let case_text = " at " + str(potential_value) + " V (" + str(iterations) + " iterations)"
+        expect_close(from_empty[1].get_quantity(), steady_h_coverage(potential_value), "steady theta_H matches the formula" + case_text)
+        expect_close(from_full[1].get_quantity(), from_empty[1].get_quantity(), "steady theta_H does not depend on the initial state" + case_text)
+        expect_close(from_empty[0].get_quantity() + from_empty[1].get_quantity(), 1.0, "theta_vac + theta_H stays 1" + case_text)
+        expect_true(from_empty[3].get_quantity() == 1.0, "the constant H+ is unchanged" + case_text)
+    let no_reactions: list[cg.Reaction] = []
+    mut untouched: list[cg.Species] = [make_vacancy(0.4), make_h_ads(0.6)]
+    expect_true(kn.settle_to_steady_state(untouched, no_reactions, env.Potential(0.0)) == 0 and untouched[1].get_quantity() == 0.6, "no reactions: nothing changes (0 iterations)")
+    mut overflowing: list[cg.Species] = [make_vacancy(1.0), make_h_ads(0.0), make_h2(1.0), make_proton(1.0)]
+    mut raised_overflow_error = False
+    try:
+        let _ = kn.settle_to_steady_state(overflowing, reactions, env.Potential(-1.0e3))
+    except OverflowError:
+        raised_overflow_error = True
+    expect_true(raised_overflow_error, "an extreme potential (-1000 V) is OverflowError from exp")
+
+# relax_raises_value_error — network.relax が ValueError を投げれば True
+#   network: 反応網
+#   species_list, potentials, time_step: relax に渡す値
+#   戻り値: ValueError なら True
+# 例: relax_raises_value_error(network, species_list, [0.0], -1.0) == True
+fn relax_raises_value_error(let network: kn.ReactionNetwork, mut species_list: list[cg.Species], let potentials: list[float], let time_step: float) -> bool:
+    try:
+        network.relax(species_list, potentials, time_step)
+    except ValueError:
+        return True
+    return False
+
+# check_relaxation — 8. 指数的な緩和と総和の調整
+# 例: check_relaxation()
+fn check_relaxation() -> None:
+    let reactions: list[cg.Reaction] = [make_volmer(True), make_heyrovsky()]
+    mut species_list: list[cg.Species] = [make_vacancy(1.0), make_h_ads(0.0), make_h2(1.0), make_proton(1.0)]
+    let network = kn.ReactionNetwork(species_list, reactions)
+    let potential = env.Potential(TEST_POTENTIAL)
+    let steady_coverage = steady_h_coverage(TEST_POTENTIAL)
+    let relaxation_rate = reactions[0].forward_rate_coefficient(potential) + reactions[0].backward_rate_coefficient(potential) + reactions[1].forward_rate_coefficient(potential) + reactions[1].backward_rate_coefficient(potential)
+
+    # 1 サブステップ: θ_H = θ_ss + (0 - θ_ss) exp(-b Δt)（b は総和を保つ系の厳密な緩和の速さ）
+    let substep = 0.002
+    network.relax(species_list, [TEST_POTENTIAL], substep)
+    expect_close(species_list[1].get_quantity(), steady_coverage * (1.0 - exp(-relaxation_rate * substep)), "one substep matches the exact exponential relaxation")
+    expect_close(species_list[0].get_quantity() + species_list[1].get_quantity(), 1.0, "the adsorbate total is 1 after a substep")
+    expect_true(species_list[2].get_quantity() == 1.0 and species_list[3].get_quantity() == 1.0, "constant solutes do not change")
+
+    # 一定電位で 60 サブステップ × 10 回 → 定常状態へ
+    mut potentials: list[float] = [TEST_POTENTIAL] * 60
+    mut frame_index = 0
+    while frame_index < 10:
+        network.relax(species_list, potentials, 0.05)
+        frame_index += 1
+    expect_close(species_list[1].get_quantity(), steady_coverage, "theta_H approaches the steady state at a constant potential")
+
+    # 時間刻みが十分長ければ、1 サブステップで定常状態（量は電位だけで決まる）
+    mut fresh: list[cg.Species] = [make_vacancy(0.0), make_h_ads(1.0), make_h2(1.0), make_proton(1.0)]
+    network.relax(fresh, [0.0], 1.0e6)
+    expect_close(fresh[1].get_quantity(), steady_h_coverage(0.0), "a very long substep lands on the steady state")
+
+    # 総和の調整: vacancy 0.5 + H_ads 0.6 = 1.1 → 最も大きい H_ads が 0.5 になる（Δt = 0 なので緩和はしない）
+    mut over_filled: list[cg.Species] = [make_vacancy(0.5), make_h_ads(0.6), make_h2(1.0), make_proton(1.0)]
+    network.relax(over_filled, [TEST_POTENTIAL], 0.0)
+    expect_close(over_filled[1].get_quantity(), 0.5, "the largest adsorbate takes up the excess total")
+    expect_close(over_filled[0].get_quantity(), 0.5, "the other adsorbate is unchanged")
+    let normalized = network.normalized_adsorbates([0.3, 0.2, 1.0, 1.0])
+    expect_close(normalized[0], 0.8, "normalized_adsorbates raises the largest adsorbate to fill the total")
+    expect_true(normalized[1] == 0.2 and normalized[2] == 1.0, "normalized_adsorbates leaves the others")
+
+    let no_potentials: list[float] = []
+    let coverage_before = species_list[1].get_quantity()
+    network.relax(species_list, no_potentials, 0.05)
+    expect_true(species_list[1].get_quantity() == coverage_before, "an empty potential list changes nothing")
+    mut reordered: list[cg.Species] = [make_h_ads(0.0), make_vacancy(1.0), make_h2(1.0), make_proton(1.0)]
+    expect_true(relax_raises_value_error(network, reordered, [TEST_POTENTIAL], 0.01), "a species list in another order is ValueError")
+    expect_true(relax_raises_value_error(network, species_list, [TEST_POTENTIAL], -0.01), "a negative time_step is ValueError")
+
+
+check_rate_coefficients()
+check_reaction()
+check_quantity_change()
+check_mass_action()
+check_linear_system()
+check_advance()
+check_steady_state()
+check_relaxation()
+print("all kinetics checks passed")

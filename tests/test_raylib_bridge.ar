@@ -11,12 +11,14 @@
 #      draw_curved_arrow_flowing）が、指定どおりの位置・色（2 色 / 3 色のグラデーション・流れる向きと量）・
 #      曲がる向きで描き、
 #      範囲外の曲率は半円に切り詰め、描けない入力（同じ 2 点・太さ 0・半径 0）では何も描かない
+#   3b. 矢じりの無い流れる線（draw_curved_line_flowing）は軸が終点まで届き、矢じりが無い。今のフレームを PNG に保存できる
 #   4. マウス位置（Vector2 の値返し）・時間（float / double）・入力の関数を呼べる
 #   5. ウィンドウを閉じられる
 # 期待と違えば RuntimeError を raise して非 0 で終わる。
 
 import[cpp-dll] ..raylib_bridge.raylib_bridge as rl
 import ..raylib_bridge.raylib_consts as rlc
+import[py] os
 
 const WINDOW_WIDTH = 480
 const WINDOW_HEIGHT = 360
@@ -177,6 +179,9 @@ fn draw_graph_scene() -> None:
     # 流れる・直線・右向き（y = 240）・flow_phase 1000.25（小数部 0.25）: 長さ 108 → 矢じり 32・軸 x = 20〜96（76 px）
     #   → 赤は x = 39、緑は x = 64.3、青は x = 89.7
     rl.draw_curved_arrow_flowing(20.0, 240.0, 128.0, 240.0, 8.0, ARROW_START_COLOR, TRICOLOR_MIDDLE_COLOR, ARROW_END_COLOR, 0.0, LARGE_FLOW_PHASE)
+    # 矢じりの無い流れる線・直線・右向き（y = 275）・flow_phase 0.25: 軸は終点まで x = 330〜470（140 px）。1/4 周（35 px）ずれて
+    #   赤は x = 365、緑は x = 411.7、青は x = 458.3。矢じりがあれば x = 438〜470 に幅 32 の三角形が出る
+    rl.draw_curved_line_flowing(330.0, 275.0, 470.0, 275.0, 8.0, ARROW_START_COLOR, TRICOLOR_MIDDLE_COLOR, ARROW_END_COLOR, 0.0, FLOW_PHASE)
 
 # check_graph_scene — draw_graph_scene が描いた画素を確かめる（draw_graph_scene の直後、end_drawing の前に呼ぶ）
 #   グラデーション: 直線の矢印の軸は x = 330（始点の色）〜 438（終点の色）で線形に変わり、矢じりは終点の色。
@@ -217,6 +222,10 @@ fn check_graph_scene() -> None:
     expect_pixel_near(39, 240, ARROW_START_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow_flowing: large flow_phase uses its fractional part (start)")
     expect_pixel_near(64, 240, TRICOLOR_MIDDLE_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow_flowing: large flow_phase uses its fractional part (middle)")
     expect_pixel_near(89, 240, ARROW_END_COLOR, GRADIENT_TOLERANCE, "draw_curved_arrow_flowing: large flow_phase uses its fractional part (end)")
+    expect_pixel_near(365, 275, ARROW_START_COLOR, GRADIENT_TOLERANCE, "draw_curved_line_flowing: start color moved 1/4 along the whole line")
+    expect_pixel_near(412, 275, TRICOLOR_MIDDLE_COLOR, GRADIENT_TOLERANCE, "draw_curved_line_flowing: middle color")
+    expect_pixel_near(458, 275, ARROW_END_COLOR, GRADIENT_TOLERANCE, "draw_curved_line_flowing: end color (the shaft reaches the end)")
+    expect_pixel(460, 285, BACKGROUND_COLOR, "draw_curved_line_flowing: no head (nothing 10 px off the line near the end)")
 
 # check_input_and_timing — 入力と時間の関数を呼び、値の範囲を確かめる（init_window の後に呼ぶ）
 # 例: check_input_and_timing()
@@ -230,6 +239,18 @@ fn check_input_and_timing() -> None:
     expect_true(rl.get_time() > 0.0, "get_time > 0")
     expect_true(rl.get_frame_time() >= 0.0, "get_frame_time >= 0")
     expect_true(rl.get_fps() >= 0, "get_fps >= 0")
+
+# check_save_screen_image — 今のフレームを画像に保存できることを確かめる（begin_drawing と end_drawing の間で呼ぶ）
+#   一時ディレクトリ（環境変数 TEMP）に PNG を書き、大きさが 0 でないことを見てから消す
+# 例: check_save_screen_image()
+fn check_save_screen_image() -> None:
+    let image_path = getenv("TEMP") + "\\test_raylib_bridge_screen.png"
+    expect_true(rl.save_screen_image(image_path.encode("utf-8")), "save_screen_image returns True")
+    mut image_file = open(image_path, "rb")
+    let image_length = len(image_file.read())
+    image_file.close()
+    expect_true(image_length > 0, "save_screen_image writes a non-empty file (" + str(image_length) + " bytes)")
+    os.remove(image_path)
 
 # ---- 本体 ----
 rl.set_trace_log_level(rlc.LOG_WARNING)
@@ -248,6 +269,7 @@ while frame_index < FRAME_COUNT:
     if frame_index == FRAME_COUNT - 1:
         check_test_scene()
         check_graph_scene()
+        check_save_screen_image()
     rl.end_drawing()
     frame_index += 1
 

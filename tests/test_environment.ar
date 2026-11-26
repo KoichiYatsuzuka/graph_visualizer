@@ -1,0 +1,65 @@
+# test_environment.ar — environment の TimeScale（周波数・周期・画面の時間からシミュレーションの時間への換算）の自動テスト
+#
+# 実行: arrow tests/test_environment.ar（tests/run_tests.ps1 が tests/test_*.ar をまとめて走らせる）。窓は開かない。
+#
+# 見ること:
+#   1. 作ると周期は 1 / 周波数、周波数を変えると周期も変わる
+#   2. simulated_time_step: 画面の 1 秒で 1 周期なら、画面の 0.5 秒は半周期
+#   3. 0・負・無限大・NaN の周波数は ValueError で、set_applied_frequency の失敗では値が変わらない
+# 期待と違えば RuntimeError を raise して非 0 で終わる。
+
+import ..environment as env
+
+const TOLERANCE = 1e-12
+
+# expect_true — 条件が偽なら RuntimeError を投げ、真なら OK を表示する
+#   condition: 確かめる条件
+#   label:     表示とエラーメッセージに出す説明
+# 例: expect_true(1 == 1, "one is one")
+fn expect_true(let condition: bool, let label: str) -> None:
+    if not condition:
+        raise RuntimeError("FAILED: " + label)
+    print("OK:", label)
+
+# expect_close — 2 つの float の差が TOLERANCE 以下か確かめる
+#   actual, expected: 比べる値
+#   label: 表示とエラーメッセージに出す説明
+# 例: expect_close(0.1 + 0.2, 0.3, "sum")
+fn expect_close(let actual: float, let expected: float, let label: str) -> None:
+    expect_true(abs(actual - expected) <= TOLERANCE, label + ": " + str(actual) + " (expected " + str(expected) + ")")
+
+# construction_raises_value_error — その周波数で TimeScale を作ると ValueError になるか
+#   frequency_value: 周波数 [Hz]
+#   戻り値: ValueError なら True
+# 例: construction_raises_value_error(0.0) == True
+fn construction_raises_value_error(let frequency_value: float) -> bool:
+    try:
+        let _ = env.TimeScale(env.Frequency(frequency_value))
+    except ValueError:
+        return True
+    return False
+
+# check_time_scale — 1〜3 をまとめて確かめる
+# 例: check_time_scale()
+fn check_time_scale() -> None:
+    mut time_scale = env.TimeScale(env.Frequency(10.0))
+    expect_close(time_scale.get_applied_frequency() => float, 10.0, "get_applied_frequency after construction")
+    expect_close(time_scale.get_period_length() => float, 0.1, "period_length is 1 / frequency (10 Hz -> 0.1 s)")
+    expect_close(time_scale.simulated_time_step(0.5, 1.0) => float, 0.05, "0.5 display seconds at 1 s per period is half a period")
+    expect_close(time_scale.simulated_time_step(1.0, 2.0) => float, 0.05, "1 display second at 2 s per period is half a period")
+    time_scale.set_applied_frequency(env.Frequency(0.01))
+    expect_close(time_scale.get_period_length() => float, 100.0, "set_applied_frequency updates period_length (0.01 Hz -> 100 s)")
+    expect_true(construction_raises_value_error(0.0), "frequency 0 is ValueError")
+    expect_true(construction_raises_value_error(-5.0), "a negative frequency is ValueError")
+    expect_true(construction_raises_value_error(float("inf")), "an infinite frequency is ValueError")
+    expect_true(construction_raises_value_error(float("nan")), "a NaN frequency is ValueError")
+    mut raised_value_error = False
+    try:
+        time_scale.set_applied_frequency(env.Frequency(0.0))
+    except ValueError:
+        raised_value_error = True
+    expect_true(raised_value_error and (time_scale.get_applied_frequency() => float) == 0.01, "a failed set_applied_frequency keeps the old value")
+
+
+check_time_scale()
+print("all environment checks passed")

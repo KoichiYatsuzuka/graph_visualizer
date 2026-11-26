@@ -514,18 +514,20 @@ void draw_arrow_head(const ArrowPath& path, double head_length, Color head_color
     rlEnd();
 }
 
-// draw_gradient_arrow - common body of draw_curved_arrow_three_colors and draw_curved_arrow_flowing.
+// draw_gradient_arrow - common body of draw_curved_arrow_three_colors, draw_curved_arrow_flowing and
+// draw_curved_line_flowing.
 //
 // Arguments:
 //   start_x, start_y, end_x, end_y, thickness, curvature - as in draw_curved_arrow (raylib_bridge.h).
-//   gradient - colors and mode of the shaft (ShaftGradient); the head is gradient.end_color.
+//   gradient   - colors and mode of the shaft (ShaftGradient); the head is gradient.end_color.
+//   draws_head - false draws only the shaft, up to the end point (draw_curved_line_flowing).
 // Purpose:
 //   rejects the inputs that cannot be drawn (non-finite coordinates, thickness <= 0, NaN curvature, the same
 //   two points), then draws the shaft and the head.
 // Example:
-//   draw_gradient_arrow(100.0f, 300.0f, 400.0f, 300.0f, 6.0f, ShaftGradient{red, green, blue, false, 0.0}, 0.005f);
+//   draw_gradient_arrow(100.0f, 300.0f, 400.0f, 300.0f, 6.0f, ShaftGradient{red, green, blue, false, 0.0}, 0.005f, true);
 void draw_gradient_arrow(float start_x, float start_y, float end_x, float end_y, float thickness,
-                         const ShaftGradient& gradient, float curvature)
+                         const ShaftGradient& gradient, float curvature, bool draws_head)
 {
     const bool coordinates_finite = std::isfinite(start_x) && std::isfinite(start_y) && std::isfinite(end_x) &&
                                     std::isfinite(end_y);
@@ -538,6 +540,10 @@ void draw_gradient_arrow(float start_x, float start_y, float end_x, float end_y,
     }
 
     const ArrowPath path = make_arrow_path(Vector2{start_x, start_y}, Vector2{end_x, end_y}, curvature);
+    if (!draws_head) {
+        draw_arrow_shaft(path, path.length, thickness, gradient);
+        return;
+    }
     const double head_length = std::min(static_cast<double>(ARROW_HEAD_LENGTH_PER_THICKNESS * thickness),
                                         ARROW_HEAD_MAX_LENGTH_RATIO * path.length);
     draw_arrow_shaft(path, path.length - head_length, thickness, gradient);
@@ -585,7 +591,7 @@ void draw_curved_arrow_three_colors(float start_x, float start_y, float end_x, f
                                     Color start_color, Color middle_color, Color end_color, float curvature)
 {
     const ShaftGradient still_gradient = {start_color, middle_color, end_color, false, 0.0};
-    draw_gradient_arrow(start_x, start_y, end_x, end_y, thickness, still_gradient, curvature);
+    draw_gradient_arrow(start_x, start_y, end_x, end_y, thickness, still_gradient, curvature, true);
 }
 
 // draw_curved_arrow_flowing - see raylib_bridge.h for the meaning of the arguments.
@@ -603,7 +609,25 @@ void draw_curved_arrow_flowing(float start_x, float start_y, float end_x, float 
         return;
     }
     const ShaftGradient flowing_gradient = {start_color, middle_color, end_color, true, flow_phase};
-    draw_gradient_arrow(start_x, start_y, end_x, end_y, thickness, flowing_gradient, curvature);
+    draw_gradient_arrow(start_x, start_y, end_x, end_y, thickness, flowing_gradient, curvature, true);
+}
+
+// draw_curved_line_flowing - see raylib_bridge.h for the meaning of the arguments.
+//
+// Purpose:
+//   draw_curved_arrow_flowing without the head, for the part of a reaction edge that ends at the centre of the
+//   reaction (reactant -> centre); the shaft reaches the end point.
+// Example (Arrow):
+//   rl.draw_curved_line_flowing(100.0, 300.0, 400.0, 300.0, 6.0, rl.Color(255, 200, 200, 255), rl.Color(230, 41, 55, 255), rl.Color(90, 0, 20, 255), 0.002, flow_phase)
+void draw_curved_line_flowing(float start_x, float start_y, float end_x, float end_y, float thickness,
+                              Color start_color, Color middle_color, Color end_color, float curvature,
+                              double flow_phase)
+{
+    if (!std::isfinite(flow_phase)) {
+        return;
+    }
+    const ShaftGradient flowing_gradient = {start_color, middle_color, end_color, true, flow_phase};
+    draw_gradient_arrow(start_x, start_y, end_x, end_y, thickness, flowing_gradient, curvature, false);
 }
 
 // -- bridge-only helpers ---------------------------------------------------------
@@ -651,4 +675,33 @@ Color read_screen_pixel(int x, int y)
     };
     MemFree(framebuffer_pixels);
     return pixel_color;
+}
+
+// save_screen_image - save what has been drawn so far in the current frame to an image file.
+//
+// Arguments:
+//   file_name - path of the file to write (".png" writes PNG); an existing file is overwritten.
+// Returns:
+//   true when the file was written; false when the framebuffer could not be read or the file not written.
+// Purpose:
+//   lets a scene drawn in a hidden window be checked by eye. Like read_screen_pixel, the batch is flushed
+//   first and the render size is read (rows already flipped so that the top of the window is row 0).
+// Example (Arrow):
+//   rl.begin_drawing()
+//   ...                                                        # draw the scene
+//   let saved = rl.save_screen_image("scene.png".encode("utf-8"))
+//   rl.end_drawing()
+bool save_screen_image(const char* file_name)
+{
+    const int render_width = GetRenderWidth();
+    const int render_height = GetRenderHeight();
+    rlDrawRenderBatchActive();
+    unsigned char* framebuffer_pixels = rlReadScreenPixels(render_width, render_height);
+    if (framebuffer_pixels == nullptr) {
+        return false;
+    }
+    const Image screen_image = {framebuffer_pixels, render_width, render_height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+    const bool is_saved = ExportImage(screen_image, file_name);
+    MemFree(framebuffer_pixels);
+    return is_saved;
 }
