@@ -1,0 +1,190 @@
+# spectrum — 化学種の吸収スペクトル（ガウス型のピークの集まり）と、波長の格子の上の吸光度の計算
+#
+# 使い方:
+#     import spectrum as spc
+#
+#     let h_ads_peaks = spc.PeakSet([spc.Absorption(spc.Wavelength(450.0), spc.Absorbance(0.8), spc.Wavelength(50.0))])
+#     let wavelengths = spc.wavelength_grid(200.0, 800.0, 2.0)          # 200, 202, …, 800 nm
+#     let mixer = spc.SpectrumMixer(wavelengths, [h_ads_peaks])         # 量 1 のときのスペクトルを 1 回だけ計算しておく
+#     let total = mixer.mix([0.3])                                      # 毎フレーム: 量で重みを付けた総和
+#
+# 量との関係: Absorption.height は量（quantity）が 1 のときのピークの高さで、吸光度は量に比例させる（SpectrumMixer.mix の重み）。
+# この関係は表示のための仮の約束（実測・文献に基づくものではない）。
+# 依存: このモジュールは chemical_graphs を知らない（chemical_graphs の Adsorbate が PeakSet を持つ）。
+
+const GAUSSIAN_FWHM_EXPONENT = 2.772588722239781    # 4 ln 2。ガウス関数 exp(-4 ln2 (λ - λ0)² / FWHM²) は λ - λ0 = ±FWHM/2 で 1/2
+const MAX_PEAK_HEIGHT = 1.0                         # Absorption.height の上限（量 1 のときの高さ）
+
+new_type Wavelength: float      # 波長 [nm]
+
+new_type Absorbance: float      # 吸光度（無次元）
+
+# is_finite_number — value が有限の数か（NaN・正負の無限大でない）
+#   value: 調べる数
+# 例: is_finite_number(1.0) == True、is_finite_number(float("nan")) == False
+fn is_finite_number(let value: float) -> bool:
+    return value == value and abs(value) != float("inf")
+
+# Absorption — 吸収ピーク 1 本（ガウス型）
+#   メンバー:
+#     center: Wavelength（public・不変）— ピークの中心の波長 [nm]（有限）
+#     height: Absorbance（public・不変）— 量 1 のときのピークの高さ（0 より大きく MAX_PEAK_HEIGHT 以下）
+#     fwhm: Wavelength（public・不変）— 半値全幅 [nm]（0 より大きい）
+#     peak(wavelength) -> list[Absorbance] — 波長の並びの各点でのピークの値
+# 例: let band = Absorption(Wavelength(450.0), Absorbance(0.8), Wavelength(50.0))
+class Absorption:
+    public:
+    let center: Wavelength
+    let height: Absorbance #Quantity 1の時の高さ
+    let fwhm: Wavelength #半値全幅
+
+    # __init__ — ピークを作る。中心が有限でない・高さが (0, MAX_PEAK_HEIGHT] の外・半値全幅が 0 以下なら ValueError
+    #   center, height, fwhm: 上のメンバーの説明を参照
+    # 例: Absorption(Wavelength(450.0), Absorbance(0.8), Wavelength(50.0))
+    fn __init__(mut self, let center: Wavelength, let height: Absorbance, let fwhm: Wavelength) -> Self:
+        if not is_finite_number(center => float):
+            raise ValueError("peak center must be finite, got " + str(center => float))
+        if not ((height => float) > 0.0 and (height => float) <= MAX_PEAK_HEIGHT):
+            raise ValueError("peak height must be in (0, " + str(MAX_PEAK_HEIGHT) + "], got " + str(height => float))
+        if not (is_finite_number(fwhm => float) and (fwhm => float) > 0.0):
+            raise ValueError("peak fwhm must be positive and finite, got " + str(fwhm => float))
+        self.center = center
+        self.height = height
+        self.fwhm = fwhm
+        return self
+
+    # peak — 波長の並びの各点での、量 1 のときのピークの値を返す
+    #   wavelength: 波長の並び [nm]
+    #   戻り値: height × exp(-4 ln2 (λ - center)² / fwhm²)（wavelength と同じ並び・同じ長さ）
+    # 例: band.peak([Wavelength(450.0), Wavelength(475.0)])   # [0.8, 0.4]
+    fn peak(let self, let wavelength: list[Wavelength])->list[Absorbance]:
+        let center_value = self.center => float
+        let height_value = self.height => float
+        let exponent_scale = GAUSSIAN_FWHM_EXPONENT / ((self.fwhm => float) * (self.fwhm => float))
+        mut values: list[Absorbance] = []
+        for point in wavelength:
+            let offset = (point => float) - center_value
+            values.append(Absorbance(height_value * exp(-exponent_scale * offset * offset)))
+        return values
+
+# PeakSet — 1 つの化学種の吸収ピークの集まり（chemical_graphs の Adsorbate が 1 つ持つ）
+#   メンバー:
+#     peak_list: list[Absorption]（public・不変）— ピークの並び（空なら吸収しない）
+#     spectrum(wavelength) -> list[Absorbance] — 量 1 のときのスペクトル（ピークの和）
+# 例: let h_ads_peaks = PeakSet([Absorption(Wavelength(450.0), Absorbance(0.8), Wavelength(50.0))])
+class PeakSet:
+    public:
+    let peak_list: list[Absorption]
+
+    # spectrum — 波長の並びの各点での、量 1 のときの吸光度（peak() の結果の総和）を返す
+    #   wavelength: 波長の並び [nm]
+    #   戻り値: 各点の Σ peak（wavelength と同じ長さ。ピークが無ければすべて 0）
+    # 例: h_ads_peaks.spectrum(wavelength_grid(200.0, 800.0, 2.0))
+    fn spectrum(let self, let wavelength: list[Wavelength])->list[Absorbance]:
+        mut totals: list[float] = [0.0] * len(wavelength)
+        for band in self.peak_list:
+            let band_values = band.peak(wavelength)
+            for point_index in range(len(wavelength)):
+                totals[point_index] += band_values[point_index] => float
+        mut values: list[Absorbance] = []
+        for total in totals:
+            values.append(Absorbance(total))
+        return values
+
+# wavelength_grid — start から stop まで step 刻みの波長の並びを返す（両端を含む）
+#   start, stop: 両端の波長 [nm]（有限で start < stop）
+#   step: 刻み [nm]（0 より大きい。(stop - start) / step が整数でなければ stop を超えない最後の点まで）
+#   おかしな引数は ValueError。
+# 例: wavelength_grid(200.0, 206.0, 2.0)   # [200, 202, 204, 206]
+fn wavelength_grid(let start: float, let stop: float, let step: float) -> list[Wavelength]:
+    if not (is_finite_number(start) and is_finite_number(stop) and start < stop):
+        raise ValueError("wavelength range must be finite with start < stop, got " + str(start) + " .. " + str(stop))
+    if not (is_finite_number(step) and step > 0.0):
+        raise ValueError("wavelength step must be positive and finite, got " + str(step))
+    let point_count = int((stop - start) / step + 1e-9) + 1
+    mut wavelengths: list[Wavelength] = []
+    for point_index in range(point_count):
+        wavelengths.append(Wavelength(start + step * point_index))
+    return wavelengths
+
+# absorbance_values — 吸光度の並びを float の並びにする（グラフの窓へ渡す用）
+#   absorbances: 吸光度の並び
+# 例: absorbance_values([Absorbance(0.5)])   # [0.5]
+fn absorbance_values(let absorbances: list[Absorbance]) -> list[float]:
+    mut values: list[float] = []
+    for absorbance in absorbances:
+        values.append(absorbance => float)
+    return values
+
+# wavelength_values — 波長の並びを float の並びにする（グラフの窓へ渡す用）
+#   wavelengths: 波長の並び [nm]
+# 例: wavelength_values([Wavelength(200.0)])   # [200.0]
+fn wavelength_values(let wavelengths: list[Wavelength]) -> list[float]:
+    mut values: list[float] = []
+    for wavelength in wavelengths:
+        values.append(wavelength => float)
+    return values
+
+# SpectrumMixer — 複数の PeakSet のスペクトルを、重み（量）を付けて足し合わせる計算機
+#
+# PeakSet ごとの量 1 のときのスペクトルを作るときに 1 回だけ計算しておき（exp を毎フレーム計算しない）、
+# mix で 重み × スペクトル の総和を返す。
+#
+# メンバー:
+#   wavelengths: list[Wavelength]（private）— 波長の格子
+#   unit_spectra: list[list[float]]（private）— PeakSet ごとの、量 1 のときの吸光度（peak_sets と同じ並び）
+#   mix(weights) -> list[Absorbance] — Σ weights[i] × unit_spectra[i]
+#   get_wavelengths() -> list[Wavelength] — 波長の格子
+#   component_count() -> int — PeakSet の数
+#
+# 例:
+#   let mixer = SpectrumMixer(wavelength_grid(200.0, 800.0, 2.0), [vacancy_peaks, h_ads_peaks])
+#   let total = mixer.mix([0.7, 0.3])
+class SpectrumMixer:
+    private:
+    let wavelengths: list[Wavelength]
+    let unit_spectra: list[list[float]]
+
+    public:
+    # __init__ — 波長の格子の上で、PeakSet ごとの量 1 のときのスペクトルを計算しておく
+    #   wavelengths: 波長の格子（1 点以上。空なら ValueError）
+    #   peak_sets: 足し合わせる PeakSet の並び（mix の weights と同じ並び。吸収しない化学種は空の PeakSet）
+    # 例: SpectrumMixer(wavelength_grid(200.0, 800.0, 2.0), [vacancy_peaks, h_ads_peaks])
+    fn __init__(mut self, let wavelengths: list[Wavelength], let peak_sets: list[PeakSet]) -> Self:
+        if len(wavelengths) == 0:
+            raise ValueError("SpectrumMixer needs at least one wavelength")
+        self.wavelengths = wavelengths
+        mut spectra: list[list[float]] = []
+        for peak_set in peak_sets:
+            spectra.append(absorbance_values(peak_set.spectrum(wavelengths)))
+        self.unit_spectra = spectra
+        return self
+
+    # mix — 重みを付けたスペクトルの総和を返す
+    #   weights: PeakSet ごとの重み（ふつうは化学種の量。peak_sets と同じ長さでなければ ValueError）
+    #   戻り値: 各波長の Σ weights[i] × （PeakSet i の量 1 のときの吸光度）
+    # 例: mixer.mix([0.7, 0.3])
+    fn mix(let self, let weights: list[float]) -> list[Absorbance]:
+        if len(weights) != len(self.unit_spectra):
+            raise ValueError("mix needs " + str(len(self.unit_spectra)) + " weights, got " + str(len(weights)))
+        mut totals: list[float] = [0.0] * len(self.wavelengths)
+        for component_index in range(len(self.unit_spectra)):
+            let weight = weights[component_index]
+            if weight != 0.0:
+                let unit_spectrum = self.unit_spectra[component_index]
+                for point_index in range(len(totals)):
+                    totals[point_index] += weight * unit_spectrum[point_index]
+        mut values: list[Absorbance] = []
+        for total in totals:
+            values.append(Absorbance(total))
+        return values
+
+    # get_wavelengths — 波長の格子
+    # 例: wavelength_values(mixer.get_wavelengths())
+    fn get_wavelengths(let self) -> list[Wavelength]:
+        return self.wavelengths
+
+    # component_count — PeakSet の数（mix の weights の長さ）
+    # 例: mixer.component_count() == 4
+    fn component_count(let self) -> int:
+        return len(self.unit_spectra)

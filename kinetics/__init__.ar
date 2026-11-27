@@ -164,6 +164,24 @@ fn forward_reaction_rate(let reaction: cg.Reaction, let quantities: dict[str, fl
 fn backward_reaction_rate(let reaction: cg.Reaction, let quantities: dict[str, float], let potential: env.Potential) -> float:
     return reaction.backward_rate_coefficient(potential) * mass_action_product(reaction.node_B, quantities)
 
+# faradaic_current — 電子移動を含む素反応の正味の速さから、全体のファラデー電流を返す（量の単位のまま。F や面積はかけない）
+#   reactions: 反応の並び
+#   reduction_electron_counts: 各反応の正反応 1 回が受け取る電子の数（reactions と同じ並び。正反応が還元なら正、
+#                              酸化なら負、電子移動が無ければ 0）。長さが reactions と違えば ValueError
+#   quantities: {名前: 量}（quantities_by_name の戻り値）
+#   potential: 電極の電位
+#   戻り値: -Σ n_i × net_rate_i。酸化電流を正、還元電流を負とする（⚠ 符号の約束は要確認）。
+#           量が被覆率なら単位は 電子 / (サイト s)（電流密度 = F × 飽和吸着量 × この値）
+# 例: faradaic_current([volmer, heyrovsky], [1, 1], quantities_by_name(species_pool), env.Potential(-0.1))
+fn faradaic_current(let reactions: list[cg.Reaction], let reduction_electron_counts: list[int], let quantities: dict[str, float], let potential: env.Potential) -> float:
+    if len(reduction_electron_counts) != len(reactions):
+        raise ValueError("reduction_electron_counts has " + str(len(reduction_electron_counts)) + " entries but there are " + str(len(reactions)) + " reactions")
+    mut reduction_electron_rate = 0.0
+    for reaction_index in range(len(reactions)):
+        if reduction_electron_counts[reaction_index] != 0:
+            reduction_electron_rate += reduction_electron_counts[reaction_index] * net_rate(reactions[reaction_index], quantities, potential)
+    return -reduction_electron_rate
+
 
 # ---- 連立一次方程式 ----
 

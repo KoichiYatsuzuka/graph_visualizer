@@ -7,7 +7,8 @@
 #      正 / 逆の比は exp(-f (E - E0))。おかしなパラメータは ValueError
 #   2. Reaction: 速度定数の関数を呼べる・不可逆なら逆反応 0・net_stoichiometry・species_names・係数 0 は ValueError
 #   3. 量の増減: Adsorbate は変わる、is_const の Solute は変わらない
-#   4. 質量作用: net_rate（係数 2 を含む）、番号で引く形の積と偏微分、ReactionNetwork の Jacobian と d q / d t
+#   4. 質量作用: net_rate（係数 2 を含む）、番号で引く形の積と偏微分、ReactionNetwork の Jacobian と d q / d t、
+#      faradaic_current（-Σ n × net_rate・酸化が正・電子数 0 の反応は数えない・長さ違いは ValueError）
 #   5. 連立一次方程式: ピボットの入れ替えが要る行列、特異な行列は ValueError
 #   6. advance: Volmer–Heyrovsky で、陰的オイラーの 1 歩が解析式と一致・被覆率の和が 1 のまま・定常状態に収束・
 #      一定の溶存種は変わらない・長い time_step でも発散しない。名前の重複などは ValueError
@@ -209,6 +210,20 @@ fn check_mass_action() -> None:
     expect_close(network.jacobian_entry(1, 0, tafel_quantities, tafel_coefficients), 4.0 * tafel_coefficients[1][0] * 1.0 * 0.3, "jacobian d(dθ_H/dt)/dθ_vac is 4 kb p θ_vac")
     expect_close(network.time_derivatives(tafel_quantities, tafel_coefficients)[1], -2.0 * kn.net_rate(tafel, kn.quantities_by_name(tafel_species), potential), "time_derivatives agrees with -2 net_rate")
     expect_true(network.time_derivatives(tafel_quantities, tafel_coefficients)[2] == 0.0, "time_derivatives is 0 for a constant solute")
+    # ファラデー電流: -Σ n × net_rate（還元の正味の速さが正なら電流は負）
+    let heyrovsky = make_heyrovsky()
+    let both_steps: list[cg.Reaction] = [volmer, heyrovsky]
+    let expected_current = -(kn.net_rate(volmer, quantities, potential) + kn.net_rate(heyrovsky, quantities, potential))
+    expect_close(kn.faradaic_current(both_steps, [1, 1], quantities, potential), expected_current, "faradaic_current is -(r_Volmer + r_Heyrovsky) for one electron each")
+    expect_true(kn.net_rate(volmer, quantities, potential) > 0.0 and kn.faradaic_current([volmer], [1], quantities, potential) < 0.0, "a net reduction gives a negative (cathodic) current")
+    expect_close(kn.faradaic_current([volmer, tafel], [1, 0], quantities, potential), -kn.net_rate(volmer, quantities, potential), "a reaction with 0 electrons (Tafel) adds no current")
+    expect_close(kn.faradaic_current([volmer], [2], quantities, potential), -2.0 * kn.net_rate(volmer, quantities, potential), "the electron count multiplies the rate")
+    mut raised_length_error = False
+    try:
+        kn.faradaic_current(both_steps, [1], quantities, potential)
+    except ValueError:
+        raised_length_error = True
+    expect_true(raised_length_error, "faradaic_current with a count list of a different length is ValueError")
 
 # check_linear_system — 5. 連立一次方程式
 # 例: check_linear_system()

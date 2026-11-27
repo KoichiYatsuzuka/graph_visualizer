@@ -5,7 +5,7 @@ C# の WinForms で作ったスライダーの窓を Arrow から開き、スラ
 
 ## 導入（Windows・初回だけ）
 
-前提: .NET SDK 8 以降、Visual Studio 2022（Build Tools 可）の C++ ワークロード（NativeAOT のリンク）、
+前提: .NET SDK 10 以降（`net10.0-windows`）、Visual Studio 2022（Build Tools 可）の C++ ワークロード（NativeAOT のリンク）、
 Arrow（`arrow` に PATH が通っていること）、Arrow のソース（このリポジトリと同じ階層の `test_lang/`。下の「ArPtrProtocol.cs」）。
 
 ```powershell
@@ -16,7 +16,7 @@ arrow main.ar                                                        # raylib �
 ```
 
 初回の `build.ps1` は NuGet から NativeAOT のコンパイラ・ランタイムのパッケージを取ってくるので数分かかります
-（`SliderPanelBridge_native.dll` は約 57 MB）。DLL・`bin/`・`obj/`・生成した `ArrowExports.g.cs` は `.gitignore` に入れてあり、
+（`SliderPanelBridge_native.dll` は約 19 MB）。DLL・`bin/`・`obj/`・生成した `ArrowExports.g.cs` は `.gitignore` に入れてあり、
 別の PC では `build.ps1` で作り直します。
 
 ## 使い方

@@ -1,0 +1,139 @@
+# test_spectrum.ar — spectrum（ガウス型の吸収ピーク・PeakSet・波長の格子・重みを付けた総和）の自動テスト
+#
+# 実行: arrow tests/test_spectrum.ar（tests/run_tests.ps1 が tests/test_*.ar をまとめて走らせる）。窓は開かない。
+#
+# 見ること:
+#   1. Absorption: 中心で height、中心から ±FWHM/2 で height / 2、遠くで 0 に近い。高さ 0 以下・1 超え・FWHM 0 以下・中心 NaN は ValueError
+#   2. PeakSet.spectrum: ピークの和。空の PeakSet は 0
+#   3. wavelength_grid: 両端を含む等間隔。おかしな範囲・刻みは ValueError
+#   4. SpectrumMixer.mix: 重み × 量 1 のスペクトルの和（重みに比例・成分ごとに足せる）。重みの数が違えば ValueError
+#   5. 速さ: 301 点・4 成分の mix が 1 フレーム（16.7 ms）より十分速い（目安 3 ms 未満）
+# 期待と違えば RuntimeError を raise して非 0 で終わる。
+
+import ..spectrum as spc
+import[py] time
+
+const TOLERANCE = 1e-12
+const MIX_TIME_LIMIT_SECONDS = 0.003
+const MIX_REPEAT_COUNT = 20
+
+# expect_true — 条件が偽なら RuntimeError を投げ、真なら OK を表示する
+#   condition: 確かめる条件、label: 表示とエラーメッセージに出す説明
+# 例: expect_true(1 == 1, "one is one")
+fn expect_true(let condition: bool, let label: str) -> None:
+    if not condition:
+        raise RuntimeError("FAILED: " + label)
+    print("OK:", label)
+
+# expect_close — 2 つの数の差が TOLERANCE 以下なら OK、そうでなければ RuntimeError
+#   actual, expected: 比べる数、label: 説明
+# 例: expect_close(0.5, 0.5, "half")
+fn expect_close(let actual: float, let expected: float, let label: str) -> None:
+    if abs(actual - expected) > TOLERANCE:
+        raise RuntimeError("FAILED: " + label + ": " + str(actual) + " (expected " + str(expected) + ")")
+    print("OK:", label)
+
+# make_band — 中心・高さ・半値全幅の float からピークを作る
+# 例: make_band(450.0, 0.8, 50.0)
+fn make_band(let center: float, let height: float, let fwhm: float) -> spc.Absorption:
+    return spc.Absorption(spc.Wavelength(center), spc.Absorbance(height), spc.Wavelength(fwhm))
+
+# band_raises_value_error — おかしな引数でピークを作り、ValueError になれば True
+# 例: band_raises_value_error(450.0, 1.5, 50.0) == True
+fn band_raises_value_error(let center: float, let height: float, let fwhm: float) -> bool:
+    try:
+        let rejected = make_band(center, height, fwhm)
+    except ValueError:
+        return True
+    return False
+
+# wavelengths_of — float の並びを波長の並びにする
+# 例: wavelengths_of([450.0, 475.0])
+fn wavelengths_of(let values: list[float]) -> list[spc.Wavelength]:
+    mut wavelengths: list[spc.Wavelength] = []
+    for value in values:
+        wavelengths.append(spc.Wavelength(value))
+    return wavelengths
+
+# check_absorption — 1. ガウス型のピークの値と、おかしな引数
+# 例: check_absorption()
+fn check_absorption() -> None:
+    let band = make_band(450.0, 0.8, 50.0)
+    let values = spc.absorbance_values(band.peak(wavelengths_of([450.0, 475.0, 425.0, 650.0])))
+    expect_close(values[0], 0.8, "the peak value at the center is height")
+    expect_close(values[1], 0.4, "at center + FWHM/2 the value is height / 2")
+    expect_close(values[2], 0.4, "at center - FWHM/2 the value is height / 2 (symmetric)")
+    expect_true(values[3] < 1e-15, "200 nm (4 FWHM) away the value is practically 0 (0.8 exp(-64 ln2) = 4e-20)")
+    expect_true(band_raises_value_error(450.0, 1.0000001, 50.0), "height above 1 is ValueError")
+    expect_true(not band_raises_value_error(450.0, 1.0, 50.0), "height exactly 1 is allowed")
+    expect_true(band_raises_value_error(450.0, 0.0, 50.0), "height 0 is ValueError")
+    expect_true(band_raises_value_error(450.0, 0.5, 0.0), "fwhm 0 is ValueError")
+    expect_true(band_raises_value_error(float("nan"), 0.5, 50.0), "a NaN center is ValueError")
+
+# check_peak_set — 2. PeakSet はピークの和
+# 例: check_peak_set()
+fn check_peak_set() -> None:
+    let two_bands = spc.PeakSet([make_band(450.0, 0.8, 50.0), make_band(475.0, 0.2, 50.0)])
+    let values = spc.absorbance_values(two_bands.spectrum(wavelengths_of([450.0, 475.0])))
+    expect_close(values[0], 0.8 + 0.1, "PeakSet.spectrum adds the peaks (450 nm)")
+    expect_close(values[1], 0.4 + 0.2, "PeakSet.spectrum adds the peaks (475 nm)")
+    let empty_values = spc.absorbance_values(spc.PeakSet([]).spectrum(wavelengths_of([300.0, 400.0])))
+    expect_true(empty_values == [0.0, 0.0], "an empty PeakSet absorbs nothing")
+
+# grid_raises_value_error — おかしな引数で wavelength_grid を呼び、ValueError になれば True
+# 例: grid_raises_value_error(800.0, 200.0, 2.0) == True
+fn grid_raises_value_error(let start: float, let stop: float, let step: float) -> bool:
+    try:
+        spc.wavelength_grid(start, stop, step)
+    except ValueError:
+        return True
+    return False
+
+# check_wavelength_grid — 3. 波長の格子
+# 例: check_wavelength_grid()
+fn check_wavelength_grid() -> None:
+    expect_true(spc.wavelength_values(spc.wavelength_grid(200.0, 206.0, 2.0)) == [200.0, 202.0, 204.0, 206.0], "wavelength_grid includes both ends")
+    expect_true(len(spc.wavelength_grid(200.0, 800.0, 2.0)) == 301, "200-800 nm by 2 nm has 301 points")
+    expect_true(spc.wavelength_values(spc.wavelength_grid(200.0, 205.0, 2.0)) == [200.0, 202.0, 204.0], "a step that does not divide the range stops before stop")
+    expect_true(grid_raises_value_error(800.0, 200.0, 2.0), "start > stop is ValueError")
+    expect_true(grid_raises_value_error(200.0, 800.0, 0.0), "step 0 is ValueError")
+
+# mix_raises_value_error — 重みの数を間違えて mix を呼び、ValueError になれば True
+# 例: mix_raises_value_error(mixer, [1.0]) == True
+fn mix_raises_value_error(let mixer: spc.SpectrumMixer, let weights: list[float]) -> bool:
+    try:
+        mixer.mix(weights)
+    except ValueError:
+        return True
+    return False
+
+# check_mixer — 4・5. 重みを付けた総和と速さ
+# 例: check_mixer()
+fn check_mixer() -> None:
+    let wavelengths = spc.wavelength_grid(200.0, 800.0, 2.0)
+    let first_peaks = spc.PeakSet([make_band(300.0, 0.4, 40.0)])
+    let second_peaks = spc.PeakSet([make_band(450.0, 0.8, 50.0), make_band(650.0, 0.5, 60.0)])
+    let mixer = spc.SpectrumMixer(wavelengths, [first_peaks, spc.PeakSet([]), second_peaks, spc.PeakSet([])])
+    expect_true(mixer.component_count() == 4, "component_count is the number of PeakSets")
+    let mixed = spc.absorbance_values(mixer.mix([0.5, 1.0, 0.25, 1.0]))
+    let first_alone = spc.absorbance_values(first_peaks.spectrum(wavelengths))
+    let second_alone = spc.absorbance_values(second_peaks.spectrum(wavelengths))
+    mut largest_error = 0.0
+    for point_index in range(len(mixed)):
+        largest_error = max(largest_error, abs(mixed[point_index] - (0.5 * first_alone[point_index] + 0.25 * second_alone[point_index])))
+    expect_true(largest_error <= TOLERANCE, "mix is the weighted sum of the unit spectra (largest error " + str(largest_error) + ")")
+    expect_true(abs(mixed[50] - 0.5 * 0.4) < 1e-9, "at 300 nm (index 50) the value is weight x height of the first peak (the 450 nm peak adds only ~3e-12)")
+    expect_true(mix_raises_value_error(mixer, [1.0, 1.0]), "mix with a wrong number of weights is ValueError")
+    let start_seconds = time.perf_counter()
+    for repeat in range(MIX_REPEAT_COUNT):
+        spc.absorbance_values(mixer.mix([0.5, 1.0, 0.25, 1.0]))
+    let seconds_per_mix = (time.perf_counter() - start_seconds) / MIX_REPEAT_COUNT
+    print("mix + absorbance_values of 301 points x 4 components:", format(seconds_per_mix * 1000.0, ".2f"), "ms")
+    expect_true(seconds_per_mix < MIX_TIME_LIMIT_SECONDS, "mix is fast enough for every frame")
+
+
+check_absorption()
+check_peak_set()
+check_wavelength_grid()
+check_mixer()
+print("all spectrum checks passed")

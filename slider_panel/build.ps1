@@ -12,7 +12,7 @@
       2. arrow --gen-cs-exports でそのメタデータから ArrowExports.g.cs（Arrow が呼ぶ export）を作る
       3. dotnet publish（NativeAOT・生成した export を含む）で NativeAOT の DLL を作る
       4. 2 つの DLL を slider_panel/ へ写す
-    前提: .NET SDK 8 以降、Visual Studio 2022（Build Tools 可）の C++ ワークロード（NativeAOT のリンクに使う）、
+    前提: .NET SDK 10 以降、Visual Studio 2022（Build Tools 可）の C++ ワークロード（NativeAOT のリンクに使う）、
     arrow（PATH か -ArrowPath）、Arrow のソース（test_lang）の bridge/ptr_protocol/ArPtrProtocol.cs
     （生成した export が参照するが Arrow の配布物に入っていない）。
     初回は NuGet から NativeAOT のコンパイラとランタイムのパッケージを取ってくる。
@@ -36,7 +36,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $ProjectName = 'SliderPanelBridge'
-$TargetFramework = 'net8.0-windows'
+$TargetFramework = 'net10.0-windows'   # csproj の TargetFramework と同じにする
 $RuntimeIdentifier = 'win-x64'
 
 <#

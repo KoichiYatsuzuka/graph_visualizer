@@ -5,6 +5,7 @@ import environment as env
 import[cpp-dll] raylib_bridge.raylib_bridge as rl
 import raylib_bridge.raylib_consts as rlc
 import chemical_graphs as cg
+import spectrum as spc
 import kinetics as kn
 import slider_panel as sp
 import time_series_plot as tsp
@@ -16,11 +17,22 @@ import[py] waveform     # このディレクトリの waveform.py（1 フレー�
 # ⚠ 実行中の量・位置・速度は species_pool（下）が持つ。これらの変数は初期状態と、反応式で化学種を名前で指すためだけに使う
 #   （Arrow では list やフィールドに入れると写しになるので、量を 1 か所にまとめている。let にすると写しも不変になり、
 #    kn や cg.advance_spring_layout が書き換えられない）
+# 吸着種の吸収ピーク（ガウス型。中心・量 1 のときの高さ・半値全幅）。⚠ 表示のための仮の値（実在の吸収帯ではない）。
+#   ピークどうしが重ならないよう、中心の間を半値全幅の 3 倍以上あける（重なりは最大でも 1e-10 程度）。高さは 1 以下
+let vacancy_peaks = spc.PeakSet([
+    spc.Absorption(spc.Wavelength(300.0), spc.Absorbance(0.4), spc.Wavelength(40.0))
+])
+let h_ads_peaks = spc.PeakSet([
+    spc.Absorption(spc.Wavelength(450.0), spc.Absorbance(0.8), spc.Wavelength(50.0)),
+    spc.Absorption(spc.Wavelength(650.0), spc.Absorbance(0.5), spc.Wavelength(60.0))
+])
+
 mut vacancy = cg.Adsorbate(
     name = "vacancy",
     pos = cg.Position(0.5, 0.85),
     quantity = 0.0,
-    color = rl.Color(130, 130, 130, 255)
+    color = rl.Color(130, 130, 130, 255),
+    peak_set = vacancy_peaks
 )
 
 
@@ -28,7 +40,8 @@ mut H_ads = cg.Adsorbate(
     name = "H_ads",
     pos = cg.Position(0.5, 0.17),
     quantity = 1.0,
-    color = rl.Color(230, 41, 55, 255)
+    color = rl.Color(230, 41, 55, 255),
+    peak_set = h_ads_peaks
 )
 
 mut H2_gas = cg.Solute(
@@ -101,11 +114,51 @@ mut electrode_potential = env.Potential(0.0)           # このフレームの�
 mut elapsed_periods = 0.0                              # 始めからの位相 [周期]（phase_cycles と違い 1 で戻さない。frame_step が進める）
 mut electrode_potential_periods = 0.0                  # electrode_potential を計算した位相 [周期]（電位の時系列の横軸。frame_step が決める）
 
-# ---- 電位の時系列（別の窓に描く）----
-# 過去 POTENTIAL_HISTORY_FRAMES フレームの (位相 [周期], 電位 [V]) を輪のように使う配列に保存する（最初はすべて (0.0, 0.0)）。
-# 毎フレーム番号を 1 つずつずらして今の値を入れ、最後の番号の次は 0 番に戻る。窓は最新の点を赤い点で強調する。
-const POTENTIAL_HISTORY_FRAMES = 300        # 保存するフレームの数（60 FPS で 5 秒 = 5 周期分）
-mut potential_history = tsp.RingSeries(POTENTIAL_HISTORY_FRAMES)
+# ---- 時系列（別の窓に、縦に並べた 3 枚のグラフで描く）----
+# 過去 HISTORY_FRAMES フレームの値を、横軸 = 位相 [周期] として輪のように使う配列に保存する（最初はすべて (0.0, 0.0)）。
+# 毎フレーム番号を 1 つずつずらして今の値を入れ、最後の番号の次は 0 番に戻る。グラフは最新の点を赤い点で強調する。
+#   1 枚目（POTENTIAL_PANEL）: 電極の電位
+#   2 枚目（CURRENT_PANEL）  : 全体のファラデー電流（オレンジ。左軸）と電位（淡色。右軸）
+#   3 枚目（SPECIES_PANEL）  : クリックされた化学種の量（円と同じ色。左軸）と電位（淡色。右軸）
+# 化学種の量は全化学種について記録しておき、選ばれた化学種が替わったら、その化学種の記録をまとめて 3 枚目へ送り直す。
+const HISTORY_FRAMES = 300                  # 保存するフレームの数（60 FPS で 5 秒 = 5 周期分）
+const POTENTIAL_PANEL = 0                   # グラフの番号（open_history_window が足す順）
+const CURRENT_PANEL = 1
+const SPECIES_PANEL = 2
+const NO_SELECTION = -1                     # plotted_species_index の「化学種を描いていない」
+const POTENTIAL_LINE_COLOR = rl.Color(31, 119, 180, 255)   # 電位の線の色（青）
+const CURRENT_LINE_COLOR = rl.Color(255, 127, 14, 255)     # ファラデー電流の線の色（オレンジ）
+const POTENTIAL_AXIS_LABEL = "E / V"
+const CURRENT_AXIS_LABEL = "j_F / (e- site^-1 s^-1)"       # 量が被覆率なので 1 サイトあたりの電子の数 / s（F・飽和吸着量はかけない）
+const QUANTITY_AXIS_LABEL = "quantity"
+const UNSELECTED_SPECIES_TITLE = "Quantity (click a species)"
+
+# 各反応の正反応 1 回が受け取る電子の数（reactions と同じ並び。Volmer・Heyrovsky とも 1 電子の還元）
+let reduction_electron_counts: list[int] = [1, 1]
+
+mut potential_history = tsp.RingSeries(HISTORY_FRAMES)       # 電位 [V]
+mut current_history = tsp.RingSeries(HISTORY_FRAMES)         # ファラデー電流（kn.faradaic_current。酸化が正）
+mut quantity_histories: list[tsp.RingSeries] = []            # 化学種の量（species_pool と同じ並び）
+for species in species_pool:
+    quantity_histories.append(tsp.RingSeries(HISTORY_FRAMES))
+mut total_faradaic_current = 0.0             # このフレームのファラデー電流（record_histories が決める）
+mut plotted_species_index = NO_SELECTION     # 3 枚目に今描いている化学種の番号（show_histories が selected_species_index に合わせる）
+
+# ---- スペクトル（別の窓）----
+# 各吸着種のスペクトル（量 1 のときのピークの和 × 今の量）の総和を、毎フレーム 1 回計算して描く。
+# 量 1 のときのスペクトルは spectrum_mixer を作るときに 1 回だけ計算しておく（毎フレームは 量 × スペクトル の和だけ）。
+# ⚠ 波長の範囲・吸光度の範囲は仮の値（ピークがすべて入り、吸光度の和が 1 を超えない範囲）
+const SPECTRUM_WAVELENGTH_MIN = 200.0        # 横軸の左端 [nm]
+const SPECTRUM_WAVELENGTH_MAX = 800.0        # 横軸の右端 [nm]
+const SPECTRUM_WAVELENGTH_STEP = 2.0         # 波長の刻み [nm]（301 点。最も細いピークの半値全幅 40 nm に 20 点）
+const SPECTRUM_ABSORBANCE_MIN = 0.0          # 縦軸の下端
+const SPECTRUM_ABSORBANCE_MAX = 1.0          # 縦軸の上端
+
+let spectrum_wavelengths = spc.wavelength_grid(SPECTRUM_WAVELENGTH_MIN, SPECTRUM_WAVELENGTH_MAX, SPECTRUM_WAVELENGTH_STEP)
+mut species_peak_sets: list[spc.PeakSet] = []      # species_pool と同じ並び（溶存種は空 = 吸収しない）
+for species in species_pool:
+    species_peak_sets.append(species.get_peak_set())
+let spectrum_mixer = spc.SpectrumMixer(spectrum_wavelengths, species_peak_sets)
 
 # 反応の矢印のグラデーションの位相 [周期]（reactions と同じ並び。advance_reaction_flows が 速さ × 画面の経過時間 だけ進める）
 mut reaction_flow_phases: list[float] = [0.0] * len(reactions)
@@ -202,6 +255,81 @@ fn update_selection(let drawn_species: list[cg.Species], let screen_width: int, 
         selected_species_index = cg.find_species_at(drawn_species, mouse, screen_width, screen_height)
 
 
+# open_history_window — 時系列の窓を開き、電位・ファラデー電流・化学種の量の 3 枚のグラフを上から足す
+#   戻り値: 窓（グラフの番号は POTENTIAL_PANEL・CURRENT_PANEL・SPECIES_PANEL）
+#   3 枚目は化学種が選ばれるまで線を描かない。
+# 例: mut plots = open_history_window()
+fn open_history_window() -> tsp.TimeSeriesWindow:
+    mut plots = tsp.TimeSeriesWindow("graph_visualizer plots", HISTORY_FRAMES, "Period")
+    let potential_panel = plots.add_panel("Electrode potential", POTENTIAL_AXIS_LABEL, POTENTIAL_LINE_COLOR.r, POTENTIAL_LINE_COLOR.g, POTENTIAL_LINE_COLOR.b)
+    let current_panel = plots.add_panel("Faradaic current (anodic positive)", CURRENT_AXIS_LABEL, CURRENT_LINE_COLOR.r, CURRENT_LINE_COLOR.g, CURRENT_LINE_COLOR.b)
+    let species_panel = plots.add_panel(UNSELECTED_SPECIES_TITLE, QUANTITY_AXIS_LABEL, 0, 0, 0)
+    if potential_panel != POTENTIAL_PANEL or current_panel != CURRENT_PANEL or species_panel != SPECIES_PANEL:
+        raise RuntimeError("the plot panels were not numbered 0, 1, 2")
+    plots.show_overlay(CURRENT_PANEL, POTENTIAL_AXIS_LABEL)
+    plots.show_overlay(SPECIES_PANEL, POTENTIAL_AXIS_LABEL)
+    plots.set_data_visible(SPECIES_PANEL, False)
+    return plots
+
+# record_histories — このフレームの電位・ファラデー電流・全化学種の量を、横軸 electrode_potential_periods で時系列に記録する
+#   （frame_step の後に 1 フレーム 1 回呼ぶ）。total_faradaic_current・potential_history・current_history・quantity_histories を書き換える
+# 例: record_histories()
+fn record_histories() -> None:
+    let quantities = kn.quantities_by_name(species_pool)
+    total_faradaic_current = kn.faradaic_current(reactions, reduction_electron_counts, quantities, electrode_potential)
+    potential_history.record(electrode_potential_periods, electrode_potential => float)
+    current_history.record(electrode_potential_periods, total_faradaic_current)
+    for species_index in range(len(species_pool)):
+        quantity_histories[species_index].record(electrode_potential_periods, species_pool[species_index].get_quantity())
+
+# selected_index_or_no_selection — selected_species_index を int にして返す（選ばれていなければ NO_SELECTION）
+# 例: selected_index_or_no_selection()   # 何も選ばれていなければ -1
+fn selected_index_or_no_selection() -> int:
+    if selected_species_index is not None:
+        return selected_species_index
+    return NO_SELECTION
+
+# switch_species_panel — 3 枚目のグラフを、化学種 species_index の量の記録に替える（題名・線の色を替え、全点を送り直す）
+#   plots: 時系列の窓（書き換える）
+#   species_index: species_pool での番号。NO_SELECTION なら線を消して「化学種をクリック」の題名にする
+#   plotted_species_index を書き換える
+# 例: switch_species_panel(plots, 1)
+fn switch_species_panel(mut plots: tsp.TimeSeriesWindow, let species_index: int) -> None:
+    plotted_species_index = species_index
+    if species_index == NO_SELECTION:
+        plots.set_panel_title(SPECIES_PANEL, UNSELECTED_SPECIES_TITLE, QUANTITY_AXIS_LABEL)
+        plots.set_data_visible(SPECIES_PANEL, False)
+        return
+    let species = species_pool[species_index]
+    let fill_color = species.get_color()
+    plots.set_panel_title(SPECIES_PANEL, "Quantity of " + species.name, QUANTITY_AXIS_LABEL)
+    plots.set_panel_color(SPECIES_PANEL, fill_color.r, fill_color.g, fill_color.b)
+    plots.set_data_visible(SPECIES_PANEL, True)
+    plots.show_all(SPECIES_PANEL, quantity_histories[species_index])
+
+# show_histories — このフレームに記録した点を時系列の窓へ送る（待たずに戻る）。選ばれた化学種が替わっていれば 3 枚目を替える
+#   plots: 時系列の窓（書き換える。窓が閉じていれば何もしない）
+# 例: show_histories(plots)
+fn show_histories(mut plots: tsp.TimeSeriesWindow) -> None:
+    plots.show_newest(POTENTIAL_PANEL, potential_history)
+    plots.show_newest(CURRENT_PANEL, current_history)
+    plots.show_newest_overlay(potential_history)
+    let selected_index = selected_index_or_no_selection()
+    if selected_index != plotted_species_index:
+        switch_species_panel(plots, selected_index)
+    elif selected_index != NO_SELECTION:
+        plots.show_newest(SPECIES_PANEL, quantity_histories[selected_index])
+
+# show_total_spectrum — 今の量で重みを付けた全化学種のスペクトルの総和を計算し、スペクトルの窓へ送る（1 フレーム 1 回。待たずに戻る）
+#   spectrum_plot: スペクトルの窓（書き換える。窓が閉じていれば送らない）
+# 例: show_total_spectrum(spectrum_plot)
+fn show_total_spectrum(mut spectrum_plot: tsp.SpectrumWindow) -> None:
+    mut quantities: list[float] = []
+    for species in species_pool:
+        quantities.append(species.get_quantity())
+    spectrum_plot.show_absorbances(spc.absorbance_values(spectrum_mixer.mix(quantities)))
+
+
 rl.set_config_flags(rlc.FLAG_MSAA_4X_HINT)
 rl.init_window(1100, 700, "graph_visualizer".encode("utf-8"))
 rl.set_target_fps(60)
@@ -211,21 +339,25 @@ controls.add_slider("center potential [V]", -0.3, 0.3, center_potential => float
 controls.add_slider("amplitude [mV]", 0.0, 100.0, INITIAL_AMPLITUDE_MV, set_potential_amplitude_mv, 100)
 controls.add_slider("log10(frequency / Hz)", -2.0, 5.0, math.log10(INITIAL_FREQUENCY), set_log10_frequency, 700)
 
-mut potential_plot = tsp.TimeSeriesWindow("graph_visualizer potential", POTENTIAL_HISTORY_FRAMES, "Period", "E / V")
+mut plots = open_history_window()           # 電位・ファラデー電流・選んだ化学種の量の時系列の窓
+mut spectrum_plot = tsp.SpectrumWindow("graph_visualizer spectrum", "Wavelength / nm", "Absorbance")   # 吸着種のスペクトルの総和の窓
+spectrum_plot.set_axis_limits(SPECTRUM_WAVELENGTH_MIN, SPECTRUM_WAVELENGTH_MAX, SPECTRUM_ABSORBANCE_MIN, SPECTRUM_ABSORBANCE_MAX)
+spectrum_plot.set_wavelengths(spc.wavelength_values(spectrum_wavelengths))
 
 mut running = True
 
 while running:
     controls.apply_changes()        # 前のフレームから動いたスライダーの分だけ set_* が呼ばれる
     frame_step(rl.get_frame_time())  # 時間を 1 フレーム進め、サブステップごとの緩和を計算して species_pool に書き戻す
-    potential_history.record(electrode_potential_periods, electrode_potential => float)   # 次の番号に今の電位を入れる
-    potential_plot.show_newest(potential_history)                                         # 入れた点を電位の窓へ送る（待たない）
+    record_histories()               # 電位・ファラデー電流・全化学種の量を時系列の次の番号に入れる
     advance_reaction_flows(rl.get_frame_time())
     let screen_width = rl.get_screen_width()
     let screen_height = rl.get_screen_height()
     # 反応のばねで、化学種と反応の中心の 力 → 速度 → 位置 を 1 フレーム分進める（半径は今の量で決まる）
     cg.advance_spring_layout(species_pool, reactions, rl.get_frame_time(), screen_width, screen_height)
     update_selection(species_pool, screen_width, screen_height)
+    show_histories(plots)            # 記録した点を時系列の窓へ送る（クリックで選ばれた化学種が替われば 3 枚目を替える。待たない）
+    show_total_spectrum(spectrum_plot)   # 今の量でスペクトルの総和を計算してスペクトルの窓へ送る（待たない）
     rl.begin_drawing()
     rl.clear_background(cg.CANVAS_BACKGROUND_COLOR)
     rl.draw_text("graph_visualizer".encode("utf-8"), 20, 20, 24, rl.Color(40, 40, 40, 255))
@@ -236,6 +368,7 @@ while running:
     running = not rl.window_should_close()
 
 controls.close()
-potential_plot.close()
+plots.close()
+spectrum_plot.close()
 rl.close_window()
 

@@ -6,8 +6,8 @@
 | ビルドするもの | 中身 | 作るスクリプト | できるファイル |
 |---|---|---|---|
 | raylib_bridge | raylib 5.5 を Arrow から呼ぶ C++ の中継 DLL | `raylib_bridge/install_raylib.ps1` → `raylib_bridge/build.ps1` | `raylib_bridge/raylib_bridge.dll`（約 0.5 MB） |
-| slider_panel | スライダーの窓（C# WinForms・NativeAOT） | `slider_panel/build.ps1` | `slider_panel/SliderPanelBridge.dll`（約 26 KB）・`slider_panel/SliderPanelBridge_native.dll`（約 57 MB） |
-| time_series_plot | 時系列の窓（C# WinForms + ScottPlot 5 の FormsPlot・.NET 10 の NativeAOT） | `time_series_plot/build.ps1` | `time_series_plot/TimeSeriesPlotBridge.dll`（約 30 KB）・`TimeSeriesPlotBridge_native.dll`（約 21 MB）・`libSkiaSharp.dll`（約 11 MB）・`libHarfBuzzSharp.dll`（約 2 MB） |
+| slider_panel | スライダーの窓（C# WinForms・NativeAOT） | `slider_panel/build.ps1` | `slider_panel/SliderPanelBridge.dll`（約 26 KB）・`slider_panel/SliderPanelBridge_native.dll`（約 19 MB） |
+| time_series_plot | 時系列の窓・スペクトルの窓（C# WinForms + ScottPlot 5 の FormsPlot・.NET 10 の NativeAOT。1 つの DLL） | `time_series_plot/build.ps1` | `time_series_plot/TimeSeriesPlotBridge.dll`（約 30 KB）・`TimeSeriesPlotBridge_native.dll`（約 21 MB）・`libSkiaSharp.dll`（約 11 MB）・`libHarfBuzzSharp.dll`（約 2 MB） |
 
 対応する OS は **Windows x64 だけ**です（raylib は Windows 用の配布物、窓は WinForms、DLL は win-x64 向け）。
 
@@ -66,9 +66,9 @@ powershell -ExecutionPolicy Bypass -File raylib_bridge/build.ps1            # ra
 
 | もの | 要件 |
 |---|---|
-| .NET SDK | **8.0.100 以降**（`net8.0-windows` の NativeAOT と WinForms）。確かめたのは **9.0.101**。WinForms の参照（Microsoft.WindowsDesktop.App）は Windows 版の SDK に入っている |
-| ターゲット | `net8.0-windows`・`win-x64`・`PublishAot=true`・`UseWindowsForms=true`・`AllowUnsafeBlocks=true` |
-| NuGet のパッケージ | 初回の `build.ps1` が nuget.org から自動で取ってくる（版は SDK が決める。9.0.101 では 8.0.11）: `Microsoft.DotNet.ILCompiler`・`runtime.win-x64.Microsoft.DotNet.ILCompiler`・`Microsoft.NET.ILLink.Tasks`・`Microsoft.NETCore.App.Runtime.win-x64`・`Microsoft.WindowsDesktop.App.Runtime.win-x64`・`Microsoft.AspNetCore.App.Runtime.win-x64`。置き場所は `%USERPROFILE%\.nuget\packages` |
+| .NET SDK | **10.0.100 以降**（`net10.0-windows` の NativeAOT と WinForms）。確かめたのは **10.0.404**。WinForms の参照（Microsoft.WindowsDesktop.App）は Windows 版の SDK に入っている |
+| ターゲット | `net10.0-windows`・`win-x64`・`PublishAot=true`・`UseWindowsForms=true`・`AllowUnsafeBlocks=true` |
+| NuGet のパッケージ | 初回の `build.ps1` が nuget.org から自動で取ってくる（版は SDK が決める。10.0.404 では 10.0.15）: `Microsoft.DotNet.ILCompiler`・`runtime.win-x64.Microsoft.DotNet.ILCompiler`・`Microsoft.NET.ILLink.Tasks`・`Microsoft.NETCore.App.Runtime.win-x64`・`Microsoft.WindowsDesktop.App.Runtime.win-x64`・`Microsoft.AspNetCore.App.Runtime.win-x64`。置き場所は `%USERPROFILE%\.nuget\packages` |
 | C++ のツール | NativeAOT は MSVC のリンカと Windows SDK を使う（共通の Visual Studio 2022 Build Tools でよい） |
 | Arrow | `arrow --gen-cs-exports` で `ArrowExports.g.cs` を作る。実行時は、DLL の export `arrow_bridge_set_event_fire` に `ar_event_fire` を渡す Arrow（外部イベントに対応した 0.7.2 など）が要る |
 | Arrow のソース | `ArPtrProtocol.cs`（生成した `ArrowExports.g.cs` が参照するが、Arrow の配布物に入っていない）。既定はこのリポジトリと同じ階層の `../test_lang/bridge/ptr_protocol/ArPtrProtocol.cs`。別の場所なら `build.ps1 -ArPtrProtocolPath <パス>` |
@@ -88,15 +88,13 @@ powershell -ExecutionPolicy Bypass -File slider_panel/build.ps1
 `build.ps1` は ① `dotnet build`（生成物を外す）→ ② `arrow --gen-cs-exports` → ③ `dotnet publish`（NativeAOT）→ ④ DLL を
 `slider_panel/` へ写す、の順に進みます。`arrow` が PATH に無ければ `-ArrowPath <arrow.exe のパス>` で渡します。
 
-### 既知の警告（2026-11-25 時点・未対処）
+### .NET 10 への移行（2026-11-26）
 
-- **NU1903**: SDK 9.0.101 が選ぶ `Microsoft.DotNet.ILCompiler` 8.0.11 に、高い重大度の既知の脆弱性があります
-  （[GHSA-p3jp-9v83-76w9](https://github.com/advisories/GHSA-p3jp-9v83-76w9)）。NativeAOT の DLL にはこの版のランタイムが入ります。
-- **.NET 8 のサポート終了**: .NET 8 と .NET 9 のサポートは 2026-11-10 に終わりました
-  （[Microsoft の告知](https://devblogs.microsoft.com/dotnet/dotnet-8-9-end-of-support/)）。後継の .NET 10 は LTS で、2028-11-14 まで
-  サポートされます（[.NET のリリースとサポート](https://learn.microsoft.com/dotnet/core/releases-and-support)）。
-- 対処の案（未実施・未検証）: .NET 10 SDK を入れ、`slider_panel/SliderPanelBridge.csproj` の `TargetFramework` と
-  `slider_panel/build.ps1` の `$TargetFramework` を `net10.0-windows` にしてビルドし直し、`tests/run_tests.ps1` で確かめる。
+- 以前は `net8.0-windows` で、SDK 9.0.101 が選ぶ `Microsoft.DotNet.ILCompiler` 8.0.11 の脆弱性の警告 NU1903
+  （[GHSA-p3jp-9v83-76w9](https://github.com/advisories/GHSA-p3jp-9v83-76w9)）と、.NET 8 のサポート終了（2026-11-10）の問題があった。
+- `net10.0-windows`（.NET 10 は LTS で 2028-11-14 までサポート。[.NET のリリースとサポート](https://learn.microsoft.com/dotnet/core/releases-and-support)）に
+  上げて、NU1903 は出なくなった。`SliderPanelBridge_native.dll` は約 57 MB から約 19 MB になった。
+  `tests/run_tests.ps1` と、表示した窓での操作（WM_GETOBJECT を送っても落ちない・スライダーの値が Arrow へ届く）で確かめた。
 
 ## 4. time_series_plot（C# WinForms + ScottPlot・NativeAOT）
 
@@ -115,7 +113,7 @@ powershell -ExecutionPolicy Bypass -File slider_panel/build.ps1
 - slider_panel と同じく `InvariantGlobalization` は付けません。WM_GETOBJECT は、フォームは WndProc で、派生を作れない FormsPlot の中の
   窓（TransparentSKControl）は `ObjectQueryBlocker`（NativeWindow で割り込む）で止めます（`TimeSeriesPlotForm.cs`）。
 - FormsPlot の標準の右クリックのメニュー（画像の保存のダイアログ・クリップボード）は COM を使うので外しています（NativeAOT で動くかは未確認）。
-- NativeAOT の DLL が slider_panel（.NET 8）と合わせて 2 つ、同じプロセスに入ります（それぞれ別の版の .NET のランタイムを持つ）。同時に開けることは
+- NativeAOT の DLL が slider_panel と合わせて 2 つ、同じプロセスに入ります（それぞれ .NET 10 のランタイムを持つ）。同時に開けることは
   `tests/test_time_series_plot.ar` で確かめています。
 
 ```powershell
@@ -132,7 +130,7 @@ powershell -ExecutionPolicy Bypass -File raylib_bridge/install_raylib.ps1
 powershell -ExecutionPolicy Bypass -File raylib_bridge/build.ps1
 powershell -ExecutionPolicy Bypass -File slider_panel/build.ps1
 powershell -ExecutionPolicy Bypass -File time_series_plot/build.ps1
-powershell -ExecutionPolicy Bypass -File tests/run_tests.ps1    # 自動テスト（窓は表示しない）。「7 / 7 passed」なら成功
+powershell -ExecutionPolicy Bypass -File tests/run_tests.ps1    # 自動テスト（窓は表示しない）。「8 / 8 passed」なら成功
 arrow main.ar                                                   # raylib の窓・スライダーの窓・電位の時系列の窓が開く
 ```
 
@@ -140,6 +138,7 @@ arrow main.ar                                                   # raylib の窓�
 |---|---|
 | `tests/test_raylib_bridge.ar` | raylib_bridge のすべての関数を呼び、描いた画素を読み戻して色・位置を確かめる |
 | `tests/test_slider_panel.ar` | スライダーを動かすと `apply_changes` で Arrow の `mut` 変数が書き換わること、引数の誤り・窓を閉じた後の振る舞い |
-| `tests/test_time_series_plot.ar` | 輪のように使う時系列の書く順・一周後の上書き、窓の写しとの一致、ScottPlot で描けて PNG を保存できること、操作しなければ追従が続くこと、スライダーの窓と同時に開けること、窓を閉じた後の振る舞い |
+| `tests/test_spectrum.ar` | ガウス型のピーク（中心で高さ・±FWHM/2 で半分）・高さ 1 超えなどの ValueError・PeakSet の和・波長の格子・量で重みを付けた総和と、その速さ（301 点 × 4 成分が 3 ms 未満） |
+| `tests/test_time_series_plot.ar` | 輪のように使う時系列の書く順・一周後の上書き、縦に並べた 3 枚のパネルと重ね書きの系列の写しとの一致・系列の差し替え、ScottPlot で描けて PNG を保存できること、操作しなければ追従が続くこと、スライダーの窓と同時に開けること、スペクトルの窓に波長と吸光度を送って線を描けること、窓を閉じた後の振る舞い |
 
 初回の `arrow` の実行では、`import[cpp-dll]` の中継 DLL を `rustc` でコンパイルするので、起動に少し時間がかかります。

@@ -27,6 +27,7 @@ import[cpp-dll] ..raylib_bridge.raylib_bridge as rl
 import ..raylib_bridge.raylib_consts as rlc
 import ..chemical_graphs as cg
 import ..environment as env
+import ..spectrum as spc
 
 const WINDOW_WIDTH = 800
 const WINDOW_HEIGHT = 600
@@ -164,6 +165,13 @@ fn check_hit_test() -> None:
     # 半径 50（quantity 0.1）、中心 (400, 300)
     let medium = cg.Adsorbate(name = "medium", pos = cg.Position(0.5, 0.5), quantity = 0.1, color = ORANGE_COLOR)
     expect_true(medium.get_quantity() == 0.1, "get_quantity still returns the quantity")
+    expect_true(same_rgb(medium.get_color(), ORANGE_COLOR) and medium.get_color().a == ORANGE_COLOR.a, "get_color returns the fill color given at init")
+    expect_true(len(medium.get_peak_set().peak_list) == 0, "an Adsorbate made without peak_set has no peaks")
+    let band = spc.Absorption(spc.Wavelength(450.0), spc.Absorbance(0.8), spc.Wavelength(50.0))
+    let absorbing = cg.Adsorbate(name = "absorbing", pos = cg.Position(0.5, 0.5), quantity = 0.1, color = ORANGE_COLOR, peak_set = spc.PeakSet([band]))
+    expect_true(len(absorbing.get_peak_set().peak_list) == 1 and (absorbing.get_peak_set().peak_list[0].center => float) == 450.0, "get_peak_set returns the PeakSet given at init")
+    let solute = cg.Solute(name = "solute", pos = cg.Position(0.5, 0.5), quantity = 1.0, color = ORANGE_COLOR, is_const = True)
+    expect_true(len(solute.get_peak_set().peak_list) == 0, "a Solute has no peaks (the Species default)")
     expect_true(medium.contains_screen_point(rl.Vector2(400.0, 300.0), WINDOW_WIDTH, WINDOW_HEIGHT), "the center is inside")
     expect_true(medium.contains_screen_point(rl.Vector2(449.0, 300.0), WINDOW_WIDTH, WINDOW_HEIGHT), "49 px to the right of the center is inside (radius 50)")
     expect_true(medium.contains_screen_point(rl.Vector2(435.0, 335.0), WINDOW_WIDTH, WINDOW_HEIGHT), "49.5 px diagonally is inside")

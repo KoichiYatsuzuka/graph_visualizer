@@ -1,4 +1,4 @@
-# test_time_series_plot.ar — time_series_plot（輪のように使う時系列と、ScottPlot で描く C# の窓）の自動テスト
+# test_time_series_plot.ar — time_series_plot（輪のように使う時系列と、縦に並べたグラフを ScottPlot で描く C# の窓）の自動テスト
 #
 # 実行: arrow tests/test_time_series_plot.ar（tests/run_tests.ps1 が tests/test_*.ar をまとめて走らせる）
 # 前提: time_series_plot/build.ps1 と slider_panel/build.ps1 で DLL を作ってあること。
@@ -6,12 +6,16 @@
 # 見ること（窓は表示しない）:
 #   1. RingSeries: 最初はすべて (0.0, 0.0) で最新の番号は capacity - 1。record は 0 番から 1 つずつずらして書き、
 #      最後の番号の次は 0 番に戻って最も古い点を上書きする。おかしな容量は ValueError、範囲外の番号は IndexError
-#   2. TimeSeriesWindow: show_newest で RingSeries の最新の点が窓の写しの同じ番号に入り、最新の番号（赤い点）も同じになる。
-#      1 周以上回しても写しは RingSeries と一致する。容量が違えば ValueError
-#   3. 描画: render_now が例外なく描け、save_png が空でない PNG を書く（ScottPlot の FormsPlot・SkiaSharp が NativeAOT で動く）。
-#      利用者が図を動かさなければ、何度描いても追従（軸の範囲を点に合わせる）は続く
+#   2. パネル: add_panel は 0, 1, 2 を返す。show_newest で RingSeries の最新の点がそのパネルの写しの同じ番号に入り、
+#      ほかのパネルには入らない。show_newest_overlay は重ね書きの系列に入る。1 周以上回しても写しは RingSeries と一致する。
+#      show_all で別の RingSeries に替えると全点が入れ替わる。容量違いは ValueError、範囲外のパネル・色は IndexError / ValueError
+#   3. 描画: 見た目の変更（題名・色・線を消す）・重ね書きのあるパネルを render_now で描け、save_png が空でない PNG を書く
+#      （ScottPlot の FormsPlot・SkiaSharp が NativeAOT で動く）。利用者が図を動かさなければ、何度描いても追従は続く
 #   4. スライダーの窓（slider_panel）と同じプロセスで同時に開ける（NativeAOT の DLL が 2 つ）
-#   5. close の後は is_open が False、show_newest は何もせず、render_now・save_png は RuntimeError
+#   5. close の後は is_open が False、show_* と set_* は何もせず、render_now・save_png・is_following_latest は RuntimeError
+#   6. SpectrumWindow: 軸だけの空のグラフを描け、波長を決めて吸光度を送ると写しに入り、線を描いて PNG を保存できる。
+#      おかしな範囲・長さ違いの吸光度は ValueError、close の後は is_open が False で show_absorbances は何もせず、
+#      set_axis_limits・render_now は RuntimeError
 # 期待と違えば RuntimeError を raise して非 0 で終わる。
 
 import ..time_series_plot as tsp
@@ -21,6 +25,9 @@ import[py] os
 const SMALL_CAPACITY = 4
 const PLOT_CAPACITY = 300
 const FRAMES_PER_PERIOD = 60.0          # 1 周期 = 60 フレームとして横軸の値を作る
+const POTENTIAL_PANEL = 0
+const CURRENT_PANEL = 1
+const SPECIES_PANEL = 2
 
 # expect_true — 条件が偽なら RuntimeError を投げ、真なら OK を表示する
 #   condition: 確かめる条件
@@ -72,103 +79,234 @@ fn check_ring_series() -> None:
         raised_index_error = True
     expect_true(raised_index_error, "y_at with an index out of range is IndexError")
 
-# window_matches_series — 窓の写しの全点と最新の番号が series と一致するか
-#   plot: 窓、series: 時系列（容量は同じ）
-# 例: window_matches_series(plot, history) == True
-fn window_matches_series(let plot: tsp.TimeSeriesWindow, let series: tsp.RingSeries) -> bool:
-    if plot.plotted_newest_index() != series.get_newest_index():
+# panel_matches_series — パネルの主の系列の写しの全点と最新の番号が series と一致するか
+#   plots: 窓、panel: パネルの番号、series: 時系列（容量は同じ）
+# 例: panel_matches_series(plots, 0, history) == True
+fn panel_matches_series(let plots: tsp.TimeSeriesWindow, let panel: int, let series: tsp.RingSeries) -> bool:
+    if plots.plotted_newest_index(panel) != series.get_newest_index():
         return False
     for point_index in range(series.get_capacity()):
-        if plot.plotted_x(point_index) != series.x_at(point_index) or plot.plotted_y(point_index) != series.y_at(point_index):
+        if plots.plotted_x(panel, point_index) != series.x_at(point_index) or plots.plotted_y(panel, point_index) != series.y_at(point_index):
             return False
     return True
 
-# record_frames — frame_count フレーム分、横軸 = 周期・縦軸 = sin 波もどき（区分的に線形な三角波）の点を記録して窓へ送る
-#   series, plot: 時系列と窓（書き換える）
+# overlay_matches_series — 重ね書きの系列の写しの縦軸の値と最新の番号が series と一致するか
+# 例: overlay_matches_series(plots, potential_history) == True
+fn overlay_matches_series(let plots: tsp.TimeSeriesWindow, let series: tsp.RingSeries) -> bool:
+    if plots.plotted_overlay_newest_index() != series.get_newest_index():
+        return False
+    for point_index in range(series.get_capacity()):
+        if plots.plotted_overlay_y(point_index) != series.y_at(point_index):
+            return False
+    return True
+
+# triangle_wave — 周期 1 の三角波（位相 0 で -0.01、0.25 で 0.0、0.5 で 0.01、…）
+# 例: triangle_wave(0.5)   # 0.01
+fn triangle_wave(let periods: float) -> float:
+    let phase = periods % 1.0
+    if phase >= 0.5:
+        return 0.03 - 0.04 * phase
+    return 0.04 * phase - 0.01
+
+# record_frames — frame_count フレーム分、横軸 = 周期で、電位（三角波）・電流（電位の -3 倍）・量（電位の 2 倍 + 0.5）を記録して
+#   窓へ送る（電位は 1 枚目と重ね書き、電流は 2 枚目、量は 3 枚目）
+#   potential, current, quantity: 時系列（書き換える）、plots: 窓（書き換える）
 #   first_frame: 最初のフレームの番号、frame_count: フレームの数
-# 例: record_frames(history, plot, 0, 450)
-fn record_frames(mut series: tsp.RingSeries, mut plot: tsp.TimeSeriesWindow, let first_frame: int, let frame_count: int) -> None:
+# 例: record_frames(potential, current, quantity, plots, 0, 450)
+fn record_frames(mut potential: tsp.RingSeries, mut current: tsp.RingSeries, mut quantity: tsp.RingSeries, mut plots: tsp.TimeSeriesWindow, let first_frame: int, let frame_count: int) -> None:
     for frame in range(first_frame, first_frame + frame_count):
         let periods = float(frame) / FRAMES_PER_PERIOD
-        let phase = periods % 1.0
-        mut potential = 0.04 * phase - 0.01             # 0 → 0.25 周期で -0.01 → 0.0 …の三角波
-        if phase >= 0.5:
-            potential = 0.03 - 0.04 * phase
-        series.record(periods, potential)
-        plot.show_newest(series)
+        let potential_value = triangle_wave(periods)
+        potential.record(periods, potential_value)
+        current.record(periods, -3.0 * potential_value)
+        quantity.record(periods, 2.0 * potential_value + 0.5)
+        plots.show_newest(POTENTIAL_PANEL, potential)
+        plots.show_newest(CURRENT_PANEL, current)
+        plots.show_newest(SPECIES_PANEL, quantity)
+        plots.show_newest_overlay(potential)
 
-# check_window — 2〜4. 窓の写しが RingSeries と一致し、描けて PNG を保存でき、スライダーの窓と同時に開けることを確かめる
+# open_three_panels — 電位・電流・量の 3 枚のパネルの窓（非表示）を開き、番号と重ね書きを確かめる
+# 例: mut plots = open_three_panels()
+fn open_three_panels() -> tsp.TimeSeriesWindow:
+    mut plots = tsp.TimeSeriesWindow("test_time_series_plot", PLOT_CAPACITY, "Period", False)
+    expect_true(plots.panel_count() == 0, "a new window has no panel")
+    let potential_panel = plots.add_panel("Electrode potential", "E / V", 31, 119, 180)
+    let current_panel = plots.add_panel("Faradaic current", "j", 255, 127, 14)
+    let species_panel = plots.add_panel("Quantity (click a species)", "quantity", 0, 0, 0)
+    expect_true(potential_panel == 0 and current_panel == 1 and species_panel == 2 and plots.panel_count() == 3, "add_panel returns 0, 1, 2 in order")
+    plots.show_overlay(CURRENT_PANEL, "E / V")
+    plots.show_overlay(SPECIES_PANEL, "E / V")
+    return plots
+
+# check_panels — 2〜4. パネルごとの写し・重ね書き・系列の差し替え・描画・PNG・スライダーの窓との同居を確かめる
 #   戻り値: 開いたままの窓（check_closing で閉じる）
-# 例: mut plot = check_window()
-fn check_window() -> tsp.TimeSeriesWindow:
+# 例: mut plots = check_panels()
+fn check_panels() -> tsp.TimeSeriesWindow:
     mut controls = sp.SliderWindow("test_time_series_plot controls", False)
-    mut plot = tsp.TimeSeriesWindow("test_time_series_plot", PLOT_CAPACITY, "Period", "E / V", False)
-    expect_true(plot.is_open() and controls.is_open(), "the plot window and the slider window are open in the same process")
-    mut history = tsp.RingSeries(PLOT_CAPACITY)
-    expect_true(window_matches_series(plot, history), "before any point the window copy is all zero with newest index capacity - 1")
+    mut plots = open_three_panels()
+    expect_true(plots.is_open() and controls.is_open(), "the plot window and the slider window are open in the same process")
+    mut potential = tsp.RingSeries(PLOT_CAPACITY)
+    mut current = tsp.RingSeries(PLOT_CAPACITY)
+    mut quantity = tsp.RingSeries(PLOT_CAPACITY)
+    expect_true(panel_matches_series(plots, CURRENT_PANEL, current) and overlay_matches_series(plots, potential), "before any point the copies are all zero with newest index capacity - 1")
 
-    record_frames(history, plot, 0, 10)
-    expect_true(window_matches_series(plot, history), "after 10 frames the window copy matches the series")
-    expect_true(plot.plotted_newest_index() == 9, "the red point is at index 9 after 10 frames")
-    plot.render_now()
-    print("OK:", "render_now draws with ScottPlot")
-    expect_true(plot.is_following_latest(), "the plot follows the latest points at first")
+    record_frames(potential, current, quantity, plots, 0, 10)
+    expect_true(panel_matches_series(plots, POTENTIAL_PANEL, potential), "after 10 frames the potential panel matches its series")
+    expect_true(panel_matches_series(plots, CURRENT_PANEL, current), "after 10 frames the current panel matches its series (not the potential)")
+    expect_true(panel_matches_series(plots, SPECIES_PANEL, quantity), "after 10 frames the species panel matches its series")
+    expect_true(overlay_matches_series(plots, potential), "after 10 frames the overlay matches the potential")
+    plots.set_panel_title(SPECIES_PANEL, "Quantity of H_ads", "quantity")
+    plots.set_panel_color(SPECIES_PANEL, 230, 41, 55)
+    plots.render_now()
+    print("OK:", "render_now draws three panels with overlays and a style change")
+    expect_true(plots.is_following_latest(POTENTIAL_PANEL) and plots.is_following_latest(SPECIES_PANEL), "the panels follow the latest points at first")
 
-    record_frames(history, plot, 10, 440)
-    expect_true(window_matches_series(plot, history), "after 450 frames (wrapped once) the window copy matches the series")
-    expect_true(plot.plotted_newest_index() == 449 % PLOT_CAPACITY, "the red point index wraps (449 % 300 = 149)")
-    plot.render_now()
-    expect_true(plot.is_following_latest(), "redrawing new points without user input keeps following")
+    record_frames(potential, current, quantity, plots, 10, 440)
+    expect_true(panel_matches_series(plots, CURRENT_PANEL, current) and overlay_matches_series(plots, potential), "after 450 frames (wrapped once) the copies match the series")
+    expect_true(plots.plotted_newest_index(CURRENT_PANEL) == 449 % PLOT_CAPACITY, "the red point index wraps (449 % 300 = 149)")
+    plots.render_now()
+    expect_true(plots.is_following_latest(CURRENT_PANEL), "redrawing new points without user input keeps following")
+
+    plots.show_all(SPECIES_PANEL, current)
+    expect_true(panel_matches_series(plots, SPECIES_PANEL, current), "show_all replaces every point of the species panel with another series")
+    plots.set_data_visible(SPECIES_PANEL, False)
+    plots.render_now()
+    print("OK:", "render_now draws a panel whose line is hidden")
+    plots.set_data_visible(SPECIES_PANEL, True)
 
     let image_path = getenv("TEMP") + "\\test_time_series_plot.png"
-    plot.save_png(image_path, 800, 450)
+    plots.save_png(image_path, 800, 900)
     mut image_file = open(image_path, "rb")
     let image_length = len(image_file.read())
     image_file.close()
-    expect_true(image_length > 1000, "save_png writes a PNG (" + str(image_length) + " bytes)")
+    expect_true(image_length > 1000, "save_png writes a PNG of the three panels (" + str(image_length) + " bytes)")
     os.remove(image_path)
 
+    check_invalid_arguments(plots)
+    controls.close()
+    return plots
+
+# check_invalid_arguments — 容量違い・範囲外のパネル・範囲外の色が Arrow の例外になることを確かめる
+#   plots: 3 枚のパネルの開いた窓
+# 例: check_invalid_arguments(plots)
+fn check_invalid_arguments(mut plots: tsp.TimeSeriesWindow) -> None:
     mut raised_value_error = False
     try:
-        plot.show_newest(tsp.RingSeries(SMALL_CAPACITY))
+        plots.show_newest(POTENTIAL_PANEL, tsp.RingSeries(SMALL_CAPACITY))
     except ValueError:
         raised_value_error = True
     expect_true(raised_value_error, "show_newest with a different capacity is ValueError")
-    controls.close()
-    return plot
+    mut raised_panel_error = False
+    try:
+        plots.show_newest(3, tsp.RingSeries(PLOT_CAPACITY))
+    except IndexError:
+        raised_panel_error = True
+    expect_true(raised_panel_error, "show_newest to panel 3 of 3 is IndexError")
+    mut raised_color_error = False
+    try:
+        plots.set_panel_color(SPECIES_PANEL, 256, 0, 0)
+    except ValueError:
+        raised_color_error = True
+    expect_true(raised_color_error, "a color component of 256 is ValueError")
 
 # check_closing — 5. 窓を閉じた後の振る舞いを確かめる
-#   plot: 開いた窓
-# 例: check_closing(plot)
-fn check_closing(mut plot: tsp.TimeSeriesWindow) -> None:
-    plot.close()
-    expect_true(not plot.is_open(), "is_open is False after close")
-    plot.close()
+#   plots: 開いた窓（3 枚のパネル。電流のパネルの最新の番号は 149）
+# 例: check_closing(plots)
+fn check_closing(mut plots: tsp.TimeSeriesWindow) -> None:
+    plots.close()
+    expect_true(not plots.is_open(), "is_open is False after close")
+    plots.close()
     mut history = tsp.RingSeries(PLOT_CAPACITY)
     history.record(1.0, 1.0)
-    plot.show_newest(history)
-    expect_true(plot.plotted_newest_index() == 149, "show_newest after close does nothing")
+    plots.show_newest(CURRENT_PANEL, history)
+    plots.show_newest_overlay(history)
+    plots.show_all(SPECIES_PANEL, history)
+    plots.set_panel_title(SPECIES_PANEL, "late", "late")
+    plots.set_panel_color(SPECIES_PANEL, 1, 2, 3)
+    plots.set_data_visible(SPECIES_PANEL, False)
+    expect_true(plots.plotted_newest_index(CURRENT_PANEL) == 149, "show_* and set_* after close do nothing")
     mut raised_on_render = False
     try:
-        plot.render_now()
+        plots.render_now()
     except RuntimeError:
         raised_on_render = True
     expect_true(raised_on_render, "render_now after close is RuntimeError")
     mut raised_on_save = False
     try:
-        plot.save_png(getenv("TEMP") + "\\test_time_series_plot_closed.png", 100, 100)
+        plots.save_png(getenv("TEMP") + "\\test_time_series_plot_closed.png", 100, 100)
     except RuntimeError:
         raised_on_save = True
     expect_true(raised_on_save, "save_png after close is RuntimeError")
     mut raised_on_following = False
     try:
-        plot.is_following_latest()
+        plots.is_following_latest(POTENTIAL_PANEL)
     except RuntimeError:
         raised_on_following = True
     expect_true(raised_on_following, "is_following_latest after close is RuntimeError")
 
 
+# spectrum_limits_raise_value_error — set_axis_limits がおかしな範囲で ValueError を投げれば True
+#   spectrum_plot: 開いた窓、x_min, x_max, y_min, y_max: 渡す範囲
+# 例: spectrum_limits_raise_value_error(spectrum_plot, 800.0, 200.0, 0.0, 1.0) == True
+fn spectrum_limits_raise_value_error(mut spectrum_plot: tsp.SpectrumWindow, let x_min: float, let x_max: float, let y_min: float, let y_max: float) -> bool:
+    try:
+        spectrum_plot.set_axis_limits(x_min, x_max, y_min, y_max)
+    except ValueError:
+        return True
+    return False
+
+# check_spectrum_window — 6. スペクトルの窓を開き、空のグラフ・スペクトルの線を描き、閉じた後の振る舞いを確かめる
+# 例: check_spectrum_window()
+fn check_spectrum_window() -> None:
+    mut spectrum_plot = tsp.SpectrumWindow("test_time_series_plot spectrum", "Wavelength / nm", "Absorbance", False)
+    expect_true(spectrum_plot.is_open(), "the spectrum window is open after creation")
+    spectrum_plot.set_axis_limits(200.0, 800.0, 0.0, 1.0)
+    spectrum_plot.render_now()
+    print("OK:", "the empty spectrum plot draws with axis limits 200-800 x 0-1")
+    expect_true(spectrum_limits_raise_value_error(spectrum_plot, 800.0, 200.0, 0.0, 1.0), "x_min > x_max is ValueError")
+    expect_true(spectrum_limits_raise_value_error(spectrum_plot, 200.0, 800.0, 1.0, 1.0), "y_min == y_max is ValueError")
+    expect_true(spectrum_limits_raise_value_error(spectrum_plot, 200.0, float("inf"), 0.0, 1.0), "an infinite limit is ValueError")
+    expect_true(spectrum_plot.plotted_point_count() == 0, "before set_wavelengths the spectrum has no point")
+    spectrum_plot.set_wavelengths([200.0, 500.0, 800.0])
+    expect_true(spectrum_plot.plotted_point_count() == 3 and spectrum_plot.plotted_wavelength(1) == 500.0 and spectrum_plot.plotted_absorbance(1) == 0.0, "set_wavelengths sets the points with absorbance 0")
+    spectrum_plot.show_absorbances([0.1, 0.6, 0.2])
+    expect_true(spectrum_plot.plotted_absorbance(0) == 0.1 and spectrum_plot.plotted_absorbance(1) == 0.6 and spectrum_plot.plotted_absorbance(2) == 0.2, "show_absorbances writes the values")
+    spectrum_plot.render_now()
+    print("OK:", "render_now draws the spectrum line")
+    mut raised_on_length = False
+    try:
+        spectrum_plot.show_absorbances([0.1, 0.2])
+    except ValueError:
+        raised_on_length = True
+    expect_true(raised_on_length, "show_absorbances with a different length is ValueError")
+    let image_path = getenv("TEMP") + "\\test_spectrum_plot.png"
+    spectrum_plot.save_png(image_path, 800, 450)
+    mut image_file = open(image_path, "rb")
+    let image_length = len(image_file.read())
+    image_file.close()
+    expect_true(image_length > 1000, "save_png writes a PNG of the spectrum plot (" + str(image_length) + " bytes)")
+    os.remove(image_path)
+    spectrum_plot.close()
+    expect_true(not spectrum_plot.is_open(), "is_open is False after closing the spectrum window")
+    spectrum_plot.close()
+    spectrum_plot.show_absorbances([0.9, 0.9, 0.9])
+    expect_true(spectrum_plot.plotted_absorbance(1) == 0.6, "show_absorbances after close does nothing")
+    mut raised_on_limits = False
+    try:
+        spectrum_plot.set_axis_limits(200.0, 800.0, 0.0, 1.0)
+    except RuntimeError:
+        raised_on_limits = True
+    expect_true(raised_on_limits, "set_axis_limits after close is RuntimeError")
+    mut raised_on_render = False
+    try:
+        spectrum_plot.render_now()
+    except RuntimeError:
+        raised_on_render = True
+    expect_true(raised_on_render, "render_now of the spectrum window after close is RuntimeError")
+
+
 check_ring_series()
-mut plot = check_window()
-check_closing(plot)
+mut plots = check_panels()
+check_closing(plots)
+check_spectrum_window()
 print("all time_series_plot checks passed")

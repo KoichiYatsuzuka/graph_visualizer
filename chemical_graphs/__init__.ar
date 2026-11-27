@@ -1,4 +1,5 @@
 import ..environment as env
+import ..spectrum as spc
 import[cpp-dll] ..raylib_bridge.raylib_bridge as rl
 
 # ---- 化学種を円で描くときの大きさ・文字・印 ----
@@ -182,7 +183,7 @@ class Position:
 #     quantity: float（protected）— 化学種の量。円の半径を決める（radius_for_quantity）
 #     pos: Position（protected）— 円の中心の位置（窓の大きさに対する割合）
 #     color: rl.Color（protected・不変）— 円の塗りの色（作るときに渡す）
-#     get_quantity() -> float / get_pos() -> Position — quantity / pos を返す
+#     get_quantity() -> float / get_pos() -> Position / get_color() -> rl.Color — quantity / pos / color を返す
 #     get_radius() -> float — 今の quantity での円の半径 [pixel]
 #     get_screen_center(screen_width, screen_height) -> rl.Vector2 — 窓の中での円の中心 [pixel]
 #     contains_screen_point(point, screen_width, screen_height) -> bool — 窓の中の点が円に重なるか
@@ -192,6 +193,7 @@ class Position:
 #     change_quantity(amount) -> None — 量を増減させる（量が一定の化学種では何もしない）
 #     velocity_x, velocity_y: float（protected）— 速度 [pixel/s]（作ったときは 0。advance_spring_layout が更新する）
 #     get_mass() -> float — 質量点としての質量（半径に比例。mass_for_radius）
+#     get_peak_set() -> spc.PeakSet — 吸収ピークの集まり（既定は空 = 吸収しない。Adsorbate は作るときに渡したもの）
 #     get_velocity() -> rl.Vector2 — 速度
 #     move_by_force(force_x, force_y, time_step, screen_width, screen_height) -> None — 力で速度と位置を進める
 # 例: mut h2 = Solute(name = "H2", pos = Position(0.5, 0.5), quantity = 0.1, color = rl.Color(0, 121, 241, 255), is_const = True)
@@ -205,6 +207,11 @@ trait Species:
 
     fn get_pos(let self)->Position:
         return self.pos
+
+    # get_color — 円の塗りの色を返す（時系列のグラフの線も同じ色で描くため）
+    # 例: H_ads.get_color().r   # 230
+    fn get_color(let self) -> rl.Color:
+        return self.color
 
     # get_radius — 今の quantity で描く円の半径を返す
     #   戻り値: radius_for_quantity(quantity) [pixel]（quantity が NaN・正の無限大なら ValueError）
@@ -279,6 +286,12 @@ trait Species:
     fn get_mass(let self) -> float:
         return mass_for_radius(self.get_radius())
 
+    # get_peak_set — 吸収ピークの集まり（量 1 のときの値。スペクトルは量に比例させる: spc.SpectrumMixer）を返す
+    #   戻り値: 既定は空の PeakSet（吸収しない）。Adsorbate は作るときに渡した PeakSet
+    # 例: species_pool[1].get_peak_set().peak_list
+    fn get_peak_set(let self) -> spc.PeakSet:
+        return spc.PeakSet([])
+
     # get_velocity — 速度を返す
     #   戻り値: rl.Vector2(velocity_x, velocity_y) [pixel/s]（作ったときは 0）
     # 例: species.get_velocity().x
@@ -303,20 +316,32 @@ trait Species:
     mut velocity_x: float
     mut velocity_y: float
 
-# Adsorbate — 吸着種（量は被覆率。総和は kinetics.ADSORBATE_TOTAL に保たれる）。メンバーは Species と同じ
-# 例: mut H_ads = Adsorbate(name = "H_ads", pos = Position(0.5, 0.2), quantity = 1.0, color = rl.Color(230, 41, 55, 255))
+# Adsorbate — 吸着種（量は被覆率。総和は kinetics.ADSORBATE_TOTAL に保たれる）。メンバーは Species と同じに加えて
+#   peak_set: spc.PeakSet（private・不変）— 吸収ピークの集まり（get_peak_set で返す）
+# 例: mut H_ads = Adsorbate(name = "H_ads", pos = Position(0.5, 0.2), quantity = 1.0, color = rl.Color(230, 41, 55, 255),
+#                           peak_set = spc.PeakSet([spc.Absorption(spc.Wavelength(450.0), spc.Absorbance(0.8), spc.Wavelength(50.0))]))
 class Adsorbate(Species):
     public:
     # __init__ — 吸着種を作る（速度は 0 から始める）
     #   name: 名前、pos: 位置（窓に対する割合）、quantity: 量、color: 円の色
-    fn __init__(mut self, let name: str, let pos: Position, let quantity: float, let color: rl.Color) -> Self:
+    #   peak_set: 吸収ピークの集まり（省略すると空 = 吸収しない）
+    fn __init__(mut self, let name: str, let pos: Position, let quantity: float, let color: rl.Color, let peak_set: spc.PeakSet = spc.PeakSet([])) -> Self:
         self.name = name
         self.pos = pos
         self.quantity = quantity
         self.color = color
+        self.peak_set = peak_set
         self.velocity_x = 0.0
         self.velocity_y = 0.0
         return self
+
+    # get_peak_set — 作るときに渡した吸収ピークの集まりを返す
+    # 例: H_ads.get_peak_set().peak_list
+    fn get_peak_set(let self) -> spc.PeakSet:
+        return self.peak_set
+
+    private:
+    let peak_set: spc.PeakSet
 
 # Solute — 溶存種。is_const（public・不変・bool）が True なら外から無限に供給・拡散され、量は一定。ほかのメンバーは Species と同じ
 # 例: mut proton = Solute(name = "H+", pos = Position(0.5, 0.5), quantity = 1.0, color = rl.Color(255, 161, 0, 255), is_const = True)

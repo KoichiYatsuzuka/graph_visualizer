@@ -1,19 +1,30 @@
-# time_series_plot — 固定長の時系列（輪のように使う配列）を保存し、C#（WinForms + ScottPlot の FormsPlot）の窓にリアルタイムで描く
+# time_series_plot — 固定長の時系列（輪のように使う配列）を保存し、C#（WinForms + ScottPlot の FormsPlot）の窓に、
+#                    縦に並べたグラフ（パネル）でリアルタイムに描く
 #
 # 使い方（main.ar のようにリポジトリのルートのファイルから）:
 #     import time_series_plot as tsp
 #
 #     mut potential_history = tsp.RingSeries(300)                 # 300 点。最初はすべて (0.0, 0.0)
-#     mut potential_plot = tsp.TimeSeriesWindow("potential history", 300, "Period", "E / V")
+#     mut current_history = tsp.RingSeries(300)
+#     mut plots = tsp.TimeSeriesWindow("graph_visualizer plots", 300, "Period")
+#     let potential_panel = plots.add_panel("Electrode potential", "E / V", 31, 119, 180)
+#     let current_panel = plots.add_panel("Faradaic current", "j", 255, 127, 14)
+#     plots.show_overlay(current_panel, "E / V")                 # 電流のパネルに電位を右軸で淡色に重ねる
 #     while running:
 #         potential_history.record(elapsed_periods, potential)    # 番号を 1 つずつずらして今の値を入れる（最後の次は 0 番）
-#         potential_plot.show_newest(potential_history)           # 入れた点を窓へ送る（待たずに戻る）
-#     potential_plot.close()
+#         current_history.record(elapsed_periods, current)
+#         plots.show_newest(potential_panel, potential_history)   # 入れた点を窓へ送る（待たずに戻る）
+#         plots.show_newest(current_panel, current_history)
+#         plots.show_newest_overlay(potential_history)            # 重ね書きの系列（電位）も送る
+#     plots.close()
 #
-# 窓は RingSeries の点を、最も古い点から最新の点まで線でつなぎ、最新の点を赤い点で強調する。軸の範囲はふだん点に合わせる（追従）。
-# 窓の図はマウスで動かせる: 左ドラッグで移動、右ドラッグ・ホイールで拡大縮小、中ドラッグで範囲を選んで拡大。
-# 動かすと追従を止め（窓のタイトルに paused と出る）、ダブルクリックか中クリックで追従に戻る。
+# 各パネルは主の系列（左軸）を、最も古い点から最新の点まで線でつなぎ、最新の点を赤い点で強調する。
+# show_overlay したパネルには、窓に 1 本だけある重ね書きの系列を右軸に淡色で描く。軸の範囲はふだん点に合わせる（追従）。
+# 図はマウスで動かせる: 左ドラッグで移動、右ドラッグ・ホイールで拡大縮小、中ドラッグで範囲を選んで拡大。
+# 動かすとそのパネルの追従を止め（題名に paused と出る）、ダブルクリックか中クリックで追従に戻る。
 # 窓は C# の別スレッドで動き、約 30 回/秒 描き直すので、Arrow のループは止まらない。
+#
+# 同じ DLL に、スペクトルの経時変化用の窓 SpectrumWindow もある（スペクトルを 1 本の線で描く）。
 #
 # 前提: time_series_plot/build.ps1 で TimeSeriesPlotBridge.dll・TimeSeriesPlotBridge_native.dll・
 #       libSkiaSharp.dll・libHarfBuzzSharp.dll を作ってあること。
@@ -101,96 +112,197 @@ class RingSeries:
         if index < 0 or index >= len(self.x_values):
             raise IndexError("point index " + str(index) + " is out of range (capacity " + str(len(self.x_values)) + ")")
 
-# TimeSeriesWindow — RingSeries を描く C# の窓（WinForms + ScottPlot）
+# check_color_component — 色の成分が 0〜255 か確かめ、そうでなければ ValueError を投げる
+#   component: r, g, b のどれか
+# 例: check_color_component(255)   # 何も起きない
+fn check_color_component(let component: int) -> None:
+    if component < 0 or component > 255:
+        raise ValueError("color components must be 0..255, got " + str(component))
+
+# TimeSeriesWindow — RingSeries をパネル（縦に並べたグラフ）に描く C# の窓（WinForms + ScottPlot の FormsPlot）
 #
-# 窓は点の写しを持つ（番号は RingSeries と同じ）。show_newest で RingSeries の最新の点だけを送るので、
-# 窓を作った後の record ごとに 1 回 show_newest を呼ぶ（呼び忘れた点は写しに入らない）。
+# 窓はパネルごとに主の系列の写しを、窓に 1 本だけ重ね書きの系列の写しを持つ（番号は RingSeries と同じ）。
+# show_newest / show_newest_overlay は RingSeries の最新の点だけを送るので、窓を作った後の record ごとに 1 回呼ぶ
+# （呼び忘れた点は写しに入らない）。パネルに描く RingSeries を替えたときは show_all で全点を送り直す。
 # 送るのは写しを書き換えるだけで待たずに戻り、C# の UI スレッドが約 30 回/秒 で描き直す。
+# パネルの見た目（set_panel_title・set_panel_color・set_data_visible）も次の描き直しで出る。
+# show_* と set_* は窓が閉じていれば何もしない（利用者が窓を閉じても描画ループを止めないため）。
 #
 # メンバー:
 #   plot: bridge.TimeSeriesPlot — C# の窓（private）
-#   show_newest(series)         — series の最新の点を写しへ送り、赤い点をそこへ動かす
-#   plotted_x(index), plotted_y(index) -> float — 窓の写しの点の値（テスト用）
-#   plotted_newest_index() -> int — 窓の写しの最新の点の番号（テスト用）
+#   add_panel(title, y_label, red, green, blue) -> int — 一番下にパネルを足して番号を返す
+#   show_overlay(panel, label)  — パネルに重ね書きの系列を右軸（名前 label）に淡色で描く
+#   set_panel_title(panel, title, y_label) / set_panel_color(panel, red, green, blue) / set_data_visible(panel, visible)
+#                               — パネルの題名と左軸の名前・主の系列の色・主の系列を描くか
+#   show_newest(panel, series)  — series の最新の点をパネルの主の系列へ送り、赤い点をそこへ動かす
+#   show_all(panel, series)     — series の全点をパネルの主の系列へ送り直す（描く系列を替えたとき）
+#   show_newest_overlay(series) — series の最新の点を重ね書きの系列へ送る
+#   panel_count() -> int        — パネルの数
+#   plotted_x(panel, index), plotted_y(panel, index) -> float, plotted_newest_index(panel) -> int — パネルの写し（テスト用）
+#   plotted_overlay_y(index) -> float, plotted_overlay_newest_index() -> int — 重ね書きの系列の写し（テスト用）
 #   render_now()                — 送った点を今すぐ描く（描き終わるまで待つ。テスト用）
-#   is_following_latest() -> bool — 軸の範囲を点に合わせ続けているか（利用者が図を動かすと False）
-#   save_png(path, width, height) — 今の図を PNG で保存する
+#   is_following_latest(panel) -> bool — パネルの軸の範囲を点に合わせ続けているか（利用者が図を動かすと False）
+#   save_png(path, width, height) — 全パネルを縦に並べて PNG で保存する
 #   is_open() -> bool           — 窓が開いているか（利用者が閉じるボタンを押すと False）
 #   close()                     — 窓を閉じる（何度呼んでもよい）
 #
 # 例:
-#   mut potential_plot = TimeSeriesWindow("potential history", 300, "Period", "E / V")
-#   potential_plot.show_newest(potential_history)
+#   mut plots = TimeSeriesWindow("graph_visualizer plots", 300, "Period")
+#   let current_panel = plots.add_panel("Faradaic current", "j", 255, 127, 14)
+#   plots.show_newest(current_panel, current_history)
 class TimeSeriesWindow:
     private:
     let plot: bridge.TimeSeriesPlot
 
     public:
-    # __init__ — 点がすべて (0.0, 0.0) の窓を作る（窓ができるまで待って戻る）
+    # __init__ — パネルの無い窓を作る（窓ができるまで待って戻る）
     #   title:    窓のタイトル
-    #   capacity: 点の数（描く RingSeries の get_capacity() と同じにする。1 未満なら ValueError）
-    #   x_label:  横軸の名前
-    #   y_label:  縦軸の名前
+    #   capacity: 系列の点の数（描く RingSeries の get_capacity() と同じにする。1 未満なら ValueError）
+    #   x_label:  横軸の名前（一番下のパネルにだけ出す）
     #   visible:  True なら表示する。False なら表示しない（自動テスト用。点を送る・描く・保存することはできる）
-    # 例: mut potential_plot = TimeSeriesWindow("potential history", 300, "Period", "E / V")
-    fn __init__(mut self, let title: str, let capacity: int, let x_label: str, let y_label: str, let visible: bool = True) -> Self:
+    # 例: mut plots = TimeSeriesWindow("graph_visualizer plots", 300, "Period")
+    fn __init__(mut self, let title: str, let capacity: int, let x_label: str, let visible: bool = True) -> Self:
         check_capacity(capacity)
-        self.plot = bridge.TimeSeriesPlot(title, capacity, visible)
-        self.plot.SetAxisLabels(x_label, y_label)
+        self.plot = bridge.TimeSeriesPlot(title, capacity, x_label, visible)
         return self
 
-    # show_newest — series の最新の点を窓の写しの同じ番号へ送り、赤い点をそこへ動かす（待たずに戻る）
-    #   series: 描く時系列（容量が窓と違えば ValueError）
-    #   窓が閉じていれば何もしない（利用者が窓を閉じても描画ループを止めないため）。
-    # 例: potential_plot.show_newest(potential_history)
-    fn show_newest(mut self, let series: RingSeries) -> None:
-        if series.get_capacity() != self.plot.Capacity():
-            raise ValueError("series capacity " + str(series.get_capacity()) + " differs from the window capacity " + str(self.plot.Capacity()))
+    # add_panel — 一番下にパネルを足す（パネルは窓の高さを等分する）。主の系列の点はすべて (0.0, 0.0)
+    #   title: パネルの題名、y_label: 左軸の名前、red, green, blue: 主の系列の線の色（0〜255。範囲外は ValueError）
+    #   戻り値: パネルの番号（足した順に 0, 1, 2, …）
+    #   窓が閉じていれば RuntimeError。
+    # 例: let current_panel = plots.add_panel("Faradaic current", "j", 255, 127, 14)
+    fn add_panel(mut self, let title: str, let y_label: str, let red: int, let green: int, let blue: int) -> int:
+        check_color_component(red)
+        check_color_component(green)
+        check_color_component(blue)
+        self.check_open()
+        return self.plot.AddPanel(title, y_label, red, green, blue)
+
+    # show_overlay — パネルに重ね書きの系列（show_newest_overlay で送るもの）を右軸（名前 label）に淡色で描く
+    #   panel: パネルの番号（範囲外は IndexError）。窓が閉じていれば RuntimeError
+    # 例: plots.show_overlay(current_panel, "E / V")
+    fn show_overlay(mut self, let panel: int, let label: str) -> None:
+        self.check_panel(panel)
+        self.check_open()
+        self.plot.ShowOverlay(panel, label)
+
+    # set_panel_title — パネルの題名と左軸の名前を変える
+    #   panel: パネルの番号（範囲外は IndexError）
+    # 例: plots.set_panel_title(species_panel, "H_ads", "quantity")
+    fn set_panel_title(mut self, let panel: int, let title: str, let y_label: str) -> None:
+        self.check_panel(panel)
+        if self.plot.IsOpen():
+            self.plot.SetPanelTitle(panel, title, y_label)
+
+    # set_panel_color — パネルの主の系列の線の色を変える
+    #   panel: パネルの番号（範囲外は IndexError）、red, green, blue: 0〜255（範囲外は ValueError）
+    # 例: plots.set_panel_color(species_panel, 230, 41, 55)
+    fn set_panel_color(mut self, let panel: int, let red: int, let green: int, let blue: int) -> None:
+        self.check_panel(panel)
+        check_color_component(red)
+        check_color_component(green)
+        check_color_component(blue)
+        if self.plot.IsOpen():
+            self.plot.SetPanelColor(panel, red, green, blue)
+
+    # set_data_visible — パネルの主の系列（線と赤い点）を描くか（重ね書きの系列は描き続ける）
+    #   panel: パネルの番号（範囲外は IndexError）
+    # 例: plots.set_data_visible(species_panel, False)   # 化学種が選ばれていないとき
+    fn set_data_visible(mut self, let panel: int, let visible: bool) -> None:
+        self.check_panel(panel)
+        if self.plot.IsOpen():
+            self.plot.SetDataVisible(panel, visible)
+
+    # show_newest — series の最新の点をパネルの主の系列の同じ番号へ送り、赤い点をそこへ動かす（待たずに戻る）
+    #   panel: パネルの番号（範囲外は IndexError）、series: 描く時系列（容量が窓と違えば ValueError）
+    # 例: plots.show_newest(current_panel, current_history)
+    fn show_newest(mut self, let panel: int, let series: RingSeries) -> None:
+        self.check_panel(panel)
+        self.check_series(series)
         if not self.plot.IsOpen():
             return
         let newest_index = series.get_newest_index()
-        self.plot.SetPoint(newest_index, series.x_at(newest_index), series.y_at(newest_index))
+        self.plot.SetPoint(panel, newest_index, series.x_at(newest_index), series.y_at(newest_index))
 
-    # plotted_x / plotted_y — 窓の写しの番号 index の点の値（テスト用。範囲外は Arrow の例外）
-    # 例: potential_plot.plotted_y(0)
-    fn plotted_x(let self, let index: int) -> float:
-        return self.plot.XAt(index)
+    # show_all — series の全点を、最も古い点から最新の点の順にパネルの主の系列へ送る（最後に送った最新の点が赤い点になる）
+    #   パネルに描く RingSeries を替えたときに 1 回呼ぶ（capacity 回 C# を呼ぶので毎フレームは呼ばない）
+    #   panel: パネルの番号（範囲外は IndexError）、series: 描く時系列（容量が窓と違えば ValueError）
+    # 例: plots.show_all(species_panel, quantity_histories[1])
+    fn show_all(mut self, let panel: int, let series: RingSeries) -> None:
+        self.check_panel(panel)
+        self.check_series(series)
+        if not self.plot.IsOpen():
+            return
+        let capacity = series.get_capacity()
+        let oldest_index = (series.get_newest_index() + 1) % capacity
+        for offset in range(capacity):
+            let point_index = (oldest_index + offset) % capacity
+            self.plot.SetPoint(panel, point_index, series.x_at(point_index), series.y_at(point_index))
 
-    fn plotted_y(let self, let index: int) -> float:
-        return self.plot.YAt(index)
+    # show_newest_overlay — series の最新の点を重ね書きの系列の同じ番号へ送る（待たずに戻る）
+    #   series: 重ね書きする時系列（容量が窓と違えば ValueError）
+    # 例: plots.show_newest_overlay(potential_history)
+    fn show_newest_overlay(mut self, let series: RingSeries) -> None:
+        self.check_series(series)
+        if not self.plot.IsOpen():
+            return
+        let newest_index = series.get_newest_index()
+        self.plot.SetOverlayPoint(newest_index, series.x_at(newest_index), series.y_at(newest_index))
 
-    # plotted_newest_index — 窓の写しの最新の点（赤い点）の番号（show_newest の前は capacity - 1）
-    # 例: potential_plot.plotted_newest_index() == potential_history.get_newest_index()
-    fn plotted_newest_index(let self) -> int:
-        return self.plot.NewestIndex()
+    # panel_count — パネルの数
+    # 例: plots.panel_count() == 3
+    fn panel_count(let self) -> int:
+        return self.plot.PanelCount()
+
+    # plotted_x / plotted_y — パネルの主の系列の写しの番号 index の点の値（テスト用。範囲外は Arrow の例外）
+    # 例: plots.plotted_y(0, 0)
+    fn plotted_x(let self, let panel: int, let index: int) -> float:
+        return self.plot.XAt(panel, index)
+
+    fn plotted_y(let self, let panel: int, let index: int) -> float:
+        return self.plot.YAt(panel, index)
+
+    # plotted_newest_index — パネルの主の系列の写しの最新の点（赤い点）の番号（show_newest の前は capacity - 1）
+    # 例: plots.plotted_newest_index(0) == potential_history.get_newest_index()
+    fn plotted_newest_index(let self, let panel: int) -> int:
+        return self.plot.NewestIndex(panel)
+
+    # plotted_overlay_y / plotted_overlay_newest_index — 重ね書きの系列の写しの値・最新の点の番号（テスト用）
+    # 例: plots.plotted_overlay_y(plots.plotted_overlay_newest_index())
+    fn plotted_overlay_y(let self, let index: int) -> float:
+        return self.plot.OverlayYAt(index)
+
+    fn plotted_overlay_newest_index(let self) -> int:
+        return self.plot.OverlayNewestIndex()
 
     # render_now — 送った点を今すぐ描く（C# の UI スレッドが描き終わるまで待つ）。窓が閉じていれば RuntimeError
-    # 例: potential_plot.render_now()
+    # 例: plots.render_now()
     fn render_now(mut self) -> None:
         self.check_open()
         self.plot.RenderNow()
 
-    # is_following_latest — 軸の範囲を点に合わせ続けているか（利用者が図を動かすと False、ダブルクリックで True に戻る）
-    #   窓が閉じていれば RuntimeError
-    # 例: if not potential_plot.is_following_latest(): print("the plot is paused")
-    fn is_following_latest(let self) -> bool:
+    # is_following_latest — パネルの軸の範囲を点に合わせ続けているか（利用者が図を動かすと False、ダブルクリックで True に戻る）
+    #   panel: パネルの番号（範囲外は IndexError）。窓が閉じていれば RuntimeError
+    # 例: if not plots.is_following_latest(0): print("the potential panel is paused")
+    fn is_following_latest(let self, let panel: int) -> bool:
+        self.check_panel(panel)
         self.check_open()
-        return self.plot.IsFollowingLatest()
+        return self.plot.IsFollowingLatest(panel)
 
-    # save_png — 今の図を width × height ピクセルの PNG で path へ保存する（窓の大きさ・表示によらない。あれば上書き）
-    #   窓が閉じていれば RuntimeError、大きさが 1 未満なら Arrow の例外。
-    # 例: potential_plot.save_png("potential_history.png", 800, 450)
+    # save_png — 全パネルを上から順に縦に並べて、width × height ピクセルの PNG で path へ保存する
+    #   （窓の大きさ・表示によらない。あれば上書き）。窓が閉じていれば RuntimeError、大きさが 1 未満なら Arrow の例外。
+    # 例: plots.save_png("plots.png", 800, 900)
     fn save_png(mut self, let path: str, let width: int, let height: int) -> None:
         self.check_open()
         self.plot.SavePng(path, width, height)
 
     # is_open — 窓が開いているか（利用者が閉じるボタンを押した後・close の後は False）
-    # 例: if not potential_plot.is_open(): print("the plot window was closed")
+    # 例: if not plots.is_open(): print("the plot window was closed")
     fn is_open(let self) -> bool:
         return self.plot.IsOpen()
 
     # close — 窓を閉じ、窓のスレッドが終わるのを待つ（何度呼んでもよい）
-    # 例: potential_plot.close()
+    # 例: plots.close()
     fn close(mut self) -> None:
         self.plot.Close()
 
@@ -199,3 +311,132 @@ class TimeSeriesWindow:
     fn check_open(let self) -> None:
         if not self.plot.IsOpen():
             raise RuntimeError("the time series plot window is closed")
+
+    # check_panel — パネルの番号が範囲外なら IndexError を投げる
+    fn check_panel(let self, let panel: int) -> None:
+        if panel < 0 or panel >= self.plot.PanelCount():
+            raise IndexError("panel index " + str(panel) + " is out of range (" + str(self.plot.PanelCount()) + " panels)")
+
+    # check_series — series の容量が窓と違えば ValueError を投げる
+    fn check_series(let self, let series: RingSeries) -> None:
+        if series.get_capacity() != self.plot.Capacity():
+            raise ValueError("series capacity " + str(series.get_capacity()) + " differs from the window capacity " + str(self.plot.Capacity()))
+
+# check_axis_range — 軸の範囲が有限で minimum < maximum か確かめ、そうでなければ ValueError を投げる
+#   minimum, maximum: 軸の両端の値
+#   axis_name: メッセージに出す軸の名前（"x" / "y"）
+# 例: check_axis_range(200.0, 800.0, "x")   # 何も起きない
+fn check_axis_range(let minimum: float, let maximum: float, let axis_name: str) -> None:
+    let is_finite = minimum == minimum and maximum == maximum and abs(minimum) != float("inf") and abs(maximum) != float("inf")
+    if not (is_finite and minimum < maximum):
+        raise ValueError(axis_name + " axis limits must be finite with minimum < maximum, got " + str(minimum) + " .. " + str(maximum))
+
+# SpectrumWindow — スペクトルの経時変化を描くための C# の窓（WinForms + ScottPlot の FormsPlot が 1 枚）
+#
+# スペクトルを 1 本の線で描く: 横軸の波長は set_wavelengths で 1 回決め、縦軸の吸光度は show_absorbances で毎フレーム送る
+# （写しを書き換えるだけで待たずに戻り、C# の UI スレッドが約 30 回/秒 で描き直す）。set_wavelengths の前は軸だけの空のグラフ。
+# 図はマウスで動かせ、ダブルクリックか中クリックで set_axis_limits の範囲に戻る。
+# 窓は C# の別スレッドで動くので、Arrow のループは止まらない。
+#
+# メンバー:
+#   plot: bridge.SpectrumPlot — C# の窓（private）
+#   set_axis_limits(x_min, x_max, y_min, y_max) — 軸の範囲を決める
+#   set_wavelengths(wavelengths) — 横軸の点（波長）を決める（吸光度は 0 に戻す）
+#   show_absorbances(absorbances) — 縦軸の値（吸光度）を送る（待たずに戻る）
+#   plotted_point_count() -> int, plotted_wavelength(index), plotted_absorbance(index) -> float — 窓の写し（テスト用）
+#   render_now()              — 今すぐ描き直す（描き終わるまで待つ。テスト用）
+#   save_png(path, width, height) — 今の図を PNG で保存する
+#   is_open() -> bool         — 窓が開いているか（利用者が閉じるボタンを押すと False）
+#   close()                   — 窓を閉じる（何度呼んでもよい）
+#
+# 例:
+#   mut spectrum_plot = SpectrumWindow("graph_visualizer spectrum", "Wavelength / nm", "Absorbance")
+#   spectrum_plot.set_axis_limits(200.0, 800.0, 0.0, 1.0)
+#   spectrum_plot.set_wavelengths([200.0, 202.0, 204.0])
+#   spectrum_plot.show_absorbances([0.0, 0.1, 0.0])
+class SpectrumWindow:
+    private:
+    let plot: bridge.SpectrumPlot
+
+    public:
+    # __init__ — 軸だけの空のグラフの窓を作る（窓ができるまで待って戻る。軸の範囲は set_axis_limits の前はどちらも 0〜1）
+    #   title:   窓のタイトル
+    #   x_label: 横軸の名前、y_label: 縦軸の名前
+    #   visible: True なら表示する。False なら表示しない（自動テスト用。描く・保存することはできる）
+    # 例: mut spectrum_plot = SpectrumWindow("graph_visualizer spectrum", "Wavelength / nm", "Absorbance")
+    fn __init__(mut self, let title: str, let x_label: str, let y_label: str, let visible: bool = True) -> Self:
+        self.plot = bridge.SpectrumPlot(title, x_label, y_label, visible)
+        return self
+
+    # set_axis_limits — 軸の範囲を決めて描き直す（ダブルクリック・中クリックでこの範囲に戻る）
+    #   x_min, x_max: 横軸の左端・右端、y_min, y_max: 縦軸の下端・上端（有限で、それぞれ min < max。そうでなければ ValueError）
+    #   窓が閉じていれば RuntimeError。
+    # 例: spectrum_plot.set_axis_limits(200.0, 800.0, 0.0, 1.0)
+    fn set_axis_limits(mut self, let x_min: float, let x_max: float, let y_min: float, let y_max: float) -> None:
+        check_axis_range(x_min, x_max, "x")
+        check_axis_range(y_min, y_max, "y")
+        self.check_open()
+        self.plot.SetAxisLimits(x_min, x_max, y_min, y_max)
+
+    # set_wavelengths — スペクトルの横軸の点（波長）を決める。吸光度はすべて 0 に戻す
+    #   wavelengths: 波長の並び（1 点以上・すべて有限。そうでなければ ValueError）
+    #   窓が閉じていれば RuntimeError。
+    # 例: spectrum_plot.set_wavelengths([200.0, 202.0, 204.0])
+    fn set_wavelengths(mut self, let wavelengths: list[float]) -> None:
+        if len(wavelengths) == 0:
+            raise ValueError("set_wavelengths needs at least one wavelength")
+        for wavelength in wavelengths:
+            if not (wavelength == wavelength and abs(wavelength) != float("inf")):
+                raise ValueError("wavelengths must be finite, got " + str(wavelength))
+        self.check_open()
+        self.plot.SetWavelengths(wavelengths)
+
+    # show_absorbances — スペクトルの縦軸の値（各波長の吸光度）を送る（待たずに戻る）
+    #   absorbances: 吸光度の並び（set_wavelengths の波長と同じ長さ。違えば ValueError）
+    #   窓が閉じていれば何もしない（利用者が窓を閉じても描画ループを止めないため）。
+    # 例: spectrum_plot.show_absorbances([0.0, 0.1, 0.0])
+    fn show_absorbances(mut self, let absorbances: list[float]) -> None:
+        if len(absorbances) != self.plot.PointCount():
+            raise ValueError("show_absorbances got " + str(len(absorbances)) + " values for " + str(self.plot.PointCount()) + " wavelengths")
+        if self.plot.IsOpen():
+            self.plot.SetAbsorbances(absorbances)
+
+    # plotted_point_count / plotted_wavelength / plotted_absorbance — 窓の写しの点の数・番号 index の波長と吸光度（テスト用）
+    # 例: spectrum_plot.plotted_absorbance(125)
+    fn plotted_point_count(let self) -> int:
+        return self.plot.PointCount()
+
+    fn plotted_wavelength(let self, let index: int) -> float:
+        return self.plot.WavelengthAt(index)
+
+    fn plotted_absorbance(let self, let index: int) -> float:
+        return self.plot.AbsorbanceAt(index)
+
+    # render_now — 送った値を今すぐ描く（C# の UI スレッドが描き終わるまで待つ）。窓が閉じていれば RuntimeError
+    # 例: spectrum_plot.render_now()
+    fn render_now(mut self) -> None:
+        self.check_open()
+        self.plot.RenderNow()
+
+    # save_png — 今の図を width × height ピクセルの PNG で path へ保存する（窓の大きさ・表示によらない。あれば上書き）
+    #   窓が閉じていれば RuntimeError、大きさが 1 未満なら Arrow の例外。
+    # 例: spectrum_plot.save_png("spectrum.png", 800, 450)
+    fn save_png(mut self, let path: str, let width: int, let height: int) -> None:
+        self.check_open()
+        self.plot.SavePng(path, width, height)
+
+    # is_open — 窓が開いているか（利用者が閉じるボタンを押した後・close の後は False）
+    # 例: if not spectrum_plot.is_open(): print("the spectrum window was closed")
+    fn is_open(let self) -> bool:
+        return self.plot.IsOpen()
+
+    # close — 窓を閉じ、窓のスレッドが終わるのを待つ（何度呼んでもよい）
+    # 例: spectrum_plot.close()
+    fn close(mut self) -> None:
+        self.plot.Close()
+
+    private:
+    # check_open — 窓が閉じていれば RuntimeError を投げる
+    fn check_open(let self) -> None:
+        if not self.plot.IsOpen():
+            raise RuntimeError("the spectrum plot window is closed")
